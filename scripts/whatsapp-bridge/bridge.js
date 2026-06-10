@@ -561,6 +561,30 @@ app.post('/edit', async (req, res) => {
   }
 });
 
+// React to a message (used for WhatsApp self-send bridging acks)
+app.post('/reaction', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, messageId, reaction } = req.body;
+  if (!chatId || !messageId) {
+    return res.status(400).json({ error: 'chatId and messageId are required' });
+  }
+
+  try {
+    await sock.sendMessage(chatId, {
+      react: {
+        text: reaction || '',
+        key: { id: messageId, fromMe: true, remoteJid: chatId },
+      },
+    });
+    res.json({ success: true });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // MIME type map and media type inference for /send-media
 const MIME_MAP = {
   jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png',
