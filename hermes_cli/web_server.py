@@ -246,7 +246,31 @@ def _has_valid_session_token(request: Request) -> bool:
 
 
 def _require_token(request: Request) -> None:
-    """Validate the ephemeral session token.  Raises 401 on mismatch."""
+    """Authorize a sensitive endpoint, raising 401 if the caller isn't allowed.
+
+    Two auth schemes protect the dashboard, exactly one active per bind:
+
+    * **Loopback / ``--insecure`` mode** (``auth_required`` False): the
+      ephemeral ``_SESSION_TOKEN`` is injected into the SPA HTML and echoed
+      back via ``X-Hermes-Session-Token`` (or the legacy ``Bearer`` header).
+      Validate it here.
+    * **Gated / OAuth mode** (``auth_required`` True): ``_SESSION_TOKEN`` is
+      NOT injected (the SPA authenticates with a session cookie), so there is
+      no token to check. The ``gated_auth_middleware`` has already verified the
+      cookie before the request reached this handler — any non-public ``/api/``
+      route it lets through carries a verified ``request.state.session``. The
+      legacy ``auth_middleware`` likewise short-circuits in this mode. Requiring
+      the (absent) token here would 401 every cookie-authenticated request,
+      making plugin install/enable/disable and the other ``_require_token``
+      endpoints permanently unreachable behind the gate. Defer to the gate.
+    """
+    if getattr(request.app.state, "auth_required", False):
+        # Gate is authoritative. It attaches ``request.state.session`` on
+        # success and 401s otherwise, so a request that reached us is already
+        # authenticated. Belt-and-braces: confirm the session is present.
+        if getattr(request.state, "session", None) is not None:
+            return
+        raise HTTPException(status_code=401, detail="Unauthorized")
     if not _has_valid_session_token(request):
         raise HTTPException(status_code=401, detail="Unauthorized")
 
@@ -633,21 +657,6 @@ class AudioTranscriptionRequest(BaseModel):
     mime_type: Optional[str] = None
 
 
-class ModelAssignment(BaseModel):
-    """Payload for POST /api/model/set — assign a provider/model to a slot.
-
-    scope="main"        → writes model.provider + model.default
-    scope="auxiliary"   → writes auxiliary.<task>.provider + auxiliary.<task>.model
-    scope="auxiliary" with task=""  → applied to every auxiliary.* slot
-    scope="auxiliary" with task="__reset__"  → resets every slot to provider="auto"
-    """
-
-    scope: str
-    provider: str
-    model: str
-    task: str = ""
-
-
 _AUDIO_MIME_EXTENSIONS: Dict[str, str] = {
     "audio/aac": ".aac",
     "audio/flac": ".flac",
@@ -689,6 +698,7 @@ class ModelAssignment(BaseModel):
     # reads model.base_url from config (it ignores OPENAI_BASE_URL), so this is
     # the path that actually wires a local endpoint into resolution.
     base_url: str = ""
+    confirm_expensive_model: bool = False
 
 
 def _apply_main_model_assignment(
@@ -1405,6 +1415,54 @@ async def update_hermes():
     }
 
 
+def _recent_upstream_commits(n: int = 20) -> List[Dict[str, Any]]:
+    """Commits the local checkout is behind ``origin/main`` by, newest first.
+
+    Logs the SAME range the behind-count uses (``HEAD..origin/main`` — see
+    ``banner._check_via_local_git``), NOT the branch's ``@{upstream}``. On a
+    feature-branch checkout ``@{upstream}`` is the branch's own tip (zero
+    commits), which would leave the changelog empty even though the count is
+    non-zero. Pinning to ``origin/main`` keeps count and changelog consistent.
+
+    Best-effort: returns [] if not a git checkout, origin/main is unreachable,
+    or git is unavailable. Never raises into the request path.
+    """
+    try:
+        out = subprocess.run(
+            [
+                "git",
+                "-C",
+                str(PROJECT_ROOT),
+                "log",
+                "--format=%H%x1f%s%x1f%an%x1f%ct",
+                "HEAD..origin/main",
+                f"-n{int(n)}",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if out.returncode != 0:
+            return []
+        rows: List[Dict[str, Any]] = []
+        for line in out.stdout.splitlines():
+            if not line.strip():
+                continue
+            parts = (line.split("\x1f") + ["", "", "", "0"])[:4]
+            sha, summary, author, at = parts
+            rows.append(
+                {
+                    "sha": sha[:7],
+                    "summary": summary,
+                    "author": author,
+                    "at": int(at or 0),
+                }
+            )
+        return rows
+    except Exception:
+        return []
+
+
 @app.get("/api/hermes/update/check")
 async def check_hermes_update(force: bool = False):
     """Report whether a Hermes update is available, without applying it.
@@ -1425,6 +1483,11 @@ async def check_hermes_update(force: bool = False):
                    user must update out-of-band
         update_command: the recommended command for this install method
         message: human-readable guidance for non-applyable methods
+        commits: for git/pip installs that are behind, a list of the commits
+                 the local checkout is behind upstream by — each
+                 {sha, summary, author, at}. Absent/empty otherwise. The
+                 desktop's remote update overlay renders this as "what's
+                 changed". Additive: existing consumers ignore it.
     """
     install_method = detect_install_method(PROJECT_ROOT)
     update_command = recommended_update_command_for_method(install_method)
@@ -1467,6 +1530,11 @@ async def check_hermes_update(force: bool = False):
         payload["message"] = "You're on the latest version."
     else:
         payload["update_available"] = True
+        # Enrich with the actual commits we're behind by, so the desktop's
+        # remote update overlay can show "what's changed". git/pip only;
+        # best-effort (empty list on any failure).
+        if install_method in ("git", "pip"):
+            payload["commits"] = await asyncio.to_thread(_recent_upstream_commits)
 
     return payload
 
@@ -2387,6 +2455,30 @@ async def set_model_assignment(body: ModelAssignment):
 
     try:
         cfg = load_config()
+
+        if model and not body.confirm_expensive_model:
+            try:
+                from hermes_cli.model_cost_guard import expensive_model_warning
+
+                # Pricing lookup can hit models.dev / a /models endpoint on a
+                # cache miss — keep it off the event loop.
+                warning = await asyncio.to_thread(
+                    expensive_model_warning,
+                    model,
+                    provider=provider,
+                    base_url=base_url,
+                )
+            except Exception:
+                warning = None
+            if warning is not None:
+                return {
+                    "ok": False,
+                    "scope": scope,
+                    "provider": provider,
+                    "model": model,
+                    "confirm_required": True,
+                    "confirm_message": warning.message,
+                }
 
         if scope == "main":
             if not provider or not model:
@@ -8230,20 +8322,32 @@ async def get_models_analytics(days: int = 30):
 # though uvicorn binds to 127.0.0.1.
 # ---------------------------------------------------------------------------
 
-# PTY bridge is POSIX-only (depends on fcntl/termios/ptyprocess).  On native
-# Windows the import raises; catch and leave PtyBridge=None so the rest of
-# the dashboard (sessions, jobs, metrics, config editor) still loads and the
-# /api/pty endpoint cleanly refuses with a WSL-suggested message.
-try:
-    from hermes_cli.pty_bridge import PtyBridge, PtyUnavailableError
-    _PTY_BRIDGE_AVAILABLE = True
-except ImportError as _pty_import_err:  # pragma: no cover - Windows-only path
-    PtyBridge = None  # type: ignore[assignment]
-    _PTY_BRIDGE_AVAILABLE = False
+# PTY bridge: POSIX uses pty_bridge (fcntl/termios/ptyprocess); native Windows
+# uses win_pty_bridge (pywinpty/ConPTY, already a declared dependency).  Both
+# expose the same public surface — spawn/read/write/resize/close/is_available —
+# so the /api/pty WebSocket handler needs no platform guards.
+if sys.platform.startswith("win"):
+    try:
+        from hermes_cli.win_pty_bridge import WinPtyBridge as PtyBridge, PtyUnavailableError
+        _PTY_BRIDGE_AVAILABLE = True
+    except ImportError:  # pragma: no cover - pywinpty missing
+        PtyBridge = None  # type: ignore[assignment]
+        _PTY_BRIDGE_AVAILABLE = False
 
-    class PtyUnavailableError(RuntimeError):  # type: ignore[no-redef]
-        """Stub on platforms where pty_bridge can't be imported."""
-        pass
+        class PtyUnavailableError(RuntimeError):  # type: ignore[no-redef]
+            """Stub when win_pty_bridge cannot be imported."""
+            pass
+else:
+    try:
+        from hermes_cli.pty_bridge import PtyBridge, PtyUnavailableError
+        _PTY_BRIDGE_AVAILABLE = True
+    except ImportError:  # pragma: no cover - dev env without ptyprocess
+        PtyBridge = None  # type: ignore[assignment]
+        _PTY_BRIDGE_AVAILABLE = False
+
+        class PtyUnavailableError(RuntimeError):  # type: ignore[no-redef]
+            """Stub on platforms where pty_bridge can't be imported."""
+            pass
 
 _RESIZE_RE = re.compile(rb"\x1b\[RESIZE:(\d+);(\d+)\]")
 _PTY_READ_CHUNK_TIMEOUT = 0.2
@@ -8503,6 +8607,11 @@ def _resolve_chat_argv(
 
     argv, cwd = _make_tui_argv(PROJECT_ROOT / "ui-tui", tui_dev=False)
     env = os.environ.copy()
+    try:
+        from hermes_cli.config import apply_terminal_config_to_env
+        apply_terminal_config_to_env(env=env)
+    except Exception:
+        _log.debug("Failed to apply terminal config bridge for dashboard chat", exc_info=True)
     env.setdefault("NODE_ENV", "production")
     # Browser-embedded chat should prefer stable wheel-based scrollback over
     # native terminal mouse tracking. When mouse tracking is enabled, wheel
@@ -9575,10 +9684,16 @@ def _merged_plugins_hub() -> Dict[str, Any]:
     plugins_root_resolved = (get_hermes_home() / "plugins").resolve()
     rows: List[Dict[str, Any]] = []
 
-    for name, version, description, source, dir_str in _discover_all_plugins():
-        if name in disabled_set:
+    for name, version, description, source, dir_str, key in _discover_all_plugins():
+        # Both the path-derived key (nested category plugins) and the bare
+        # manifest name count for enabled/disabled state, matching the runtime
+        # loader's back-compat lookup.
+        aliases = {name}
+        if key:
+            aliases.add(key)
+        if aliases & disabled_set:
             runtime_status = "disabled"
-        elif name in enabled_set:
+        elif aliases & enabled_set:
             runtime_status = "enabled"
         else:
             runtime_status = "inactive"
@@ -10078,4 +10193,9 @@ def start_server(
     uvicorn.run(
         app, host=host, port=port, log_level="warning",
         proxy_headers=bool(app.state.auth_required),
+        # Detect half-open WS connections (reverse-proxy 524, dropped tunnels)
+        # within ~20-40s so WebSocketDisconnect fires the disconnect→reap path.
+        # 20s stays under Cloudflare Tunnel's idle timeout, keeping it warm.
+        ws_ping_interval=20.0,
+        ws_ping_timeout=20.0,
     )
