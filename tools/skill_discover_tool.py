@@ -127,8 +127,19 @@ def skill_acquire(identifier, category="", task_id=None):
     Trust policy (Alon, 2026-06-18): a skill from a TRUSTED source (builtin /
     official / curated-trusted) installs automatically once the safety scan
     allows it; a skill from a community/unknown source — or one the scanner
-    flags — is held in quarantine for an operator to approve. Reuses the Hub's
-    own quarantine + scanner; never bypasses them.
+    flags — needs a human's OK before it installs. Reuses the Hub's own
+    quarantine + scanner; never bypasses them.
+
+    Approval routing (2026-06-18): when the P5.3 tool-approval gate is enabled
+    on this profile, an untrusted/flagged acquire is **staged** through that
+    gate — it opens a ``hermes-action-approval`` Kanban card (rendered in the
+    console with Approve/Reject, posted to the Mattermost approvals channel)
+    and returns ``staged``. Approving it spawns a one-shot execution worker
+    that REPLAYS this same call with a replay token; the body detects that
+    token and installs directly (operator already approved), so the community
+    install completes without a CLI step and without re-staging. With the gate
+    OFF, behaviour is unchanged: the call returns ``requires_approval`` with the
+    ``hermes skills install`` CLI hint.
     """
     if not identifier or not str(identifier).strip():
         return json.dumps({"success": False, "error": "provide a skill 'identifier' (from skill_discover)"})
@@ -139,6 +150,14 @@ def skill_acquire(identifier, category="", task_id=None):
         )
         from tools.skills_guard import scan_skill, should_allow_install
         from hermes_cli.skills_hub import _resolve_source_meta_and_bundle, _resolve_short_name
+        from tools import tool_gate
+
+        # Is this invocation the deterministic replay of an already-approved
+        # acquire? The choke-point gate does NOT consume the replay token for
+        # skill_acquire (it is not in `require_approval`), so the token survives
+        # into this body. A match means the operator approved THIS exact pending
+        # acquisition — install regardless of trust, and do NOT re-stage.
+        approved_pid = tool_gate.consume_replay_token("skill_acquire")
 
         ensure_hub_dirs()
         sources = create_source_router(GitHubAuth())
@@ -167,15 +186,47 @@ def skill_acquire(identifier, category="", task_id=None):
         scan_allows, reason = should_allow_install(scan)
         verdict = getattr(scan, "verdict", "unknown")
 
-        if trust in _AUTO_INSTALL_TRUST and scan_allows:
+        # 1. Trusted source + clean scan -> auto-install.
+        # 2. Operator already approved THIS acquire (replay) -> install regardless
+        #    of trust. The fresh re-fetch + re-scan above is a TOCTOU safeguard;
+        #    the operator's approval overrides the trust requirement, not a hard
+        #    scanner block.
+        if (trust in _AUTO_INSTALL_TRUST and scan_allows) or approved_pid:
             install_from_quarantine(qpath, bundle.name, category or "", bundle, scan)
+            note = ("Installed after operator approval." if approved_pid
+                    else "Installed (trusted source, scan passed).")
             return json.dumps({
                 "success": True, "installed": True, "skill": bundle.name,
                 "trust": trust, "scan_verdict": verdict,
-                "note": "Installed (trusted source, scan passed). Load it with skill_view.",
+                "approved_via": approved_pid or None,
+                "note": f"{note} Load it with skill_view.",
             })
 
-        # Untrusted source or flagged scan -> hold for human approval.
+        # 3. Untrusted source / flagged scan, first time. When the approval gate
+        #    is enabled, stage the acquire through it (console + Mattermost card)
+        #    so a human can approve in-band; otherwise fall back to the CLI hint.
+        gate_cfg = tool_gate.get_tool_gate_config()
+        if tool_gate.gate_enabled(gate_cfg):
+            summary = (f"Install community skill '{bundle.name}' "
+                       f"(source trust='{trust}', scan='{verdict}')")
+            staged = tool_gate.stage_deferred(
+                "skill_acquire",
+                {"identifier": ident, "category": category or ""},
+                summary=summary, config=gate_cfg,
+            )
+            return json.dumps({
+                "success": True, "installed": False, "status": "staged",
+                "skill": bundle.name, "trust": trust, "scan_verdict": verdict, "reason": reason,
+                "pending_id": staged.get("pending_id"), "card_id": staged.get("card_id"),
+                "note": (
+                    f"Acquisition of '{bundle.name}' (source trust='{trust}', scan='{verdict}') "
+                    f"is queued for operator approval — this is expected, do NOT retry. It "
+                    f"installs automatically once approved; meanwhile, delegate the task or "
+                    f"proceed without the skill."
+                ),
+            })
+
+        # 4. Gate not enabled -> hold in quarantine for the CLI approval path.
         return json.dumps({
             "success": True, "installed": False, "status": "requires_approval",
             "skill": bundle.name, "trust": trust, "scan_verdict": verdict, "reason": reason,
@@ -195,9 +246,11 @@ SKILL_ACQUIRE_SCHEMA = {
     "description": (
         "Acquire (install) a skill you found with skill_discover, so you can then use it. "
         "Only skills from TRUSTED sources install automatically (after a safety scan); skills "
-        "from community/unknown sources are held for an operator's approval and won't be "
-        "available immediately — in that case, delegate the task or proceed without. Use "
-        "sparingly: only when a task genuinely needs a capability you and your skills_list lack."
+        "from community/unknown sources are queued for an operator's approval (status "
+        "'staged') and won't be available immediately — that 'staged' result is SUCCESS, not "
+        "an error: do NOT retry it. It installs by itself once approved; meanwhile delegate "
+        "the task or proceed without. Use sparingly: only when a task genuinely needs a "
+        "capability you and your skills_list lack."
     ),
     "parameters": {
         "type": "object",
