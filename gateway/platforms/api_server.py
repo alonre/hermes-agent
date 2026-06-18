@@ -19,6 +19,10 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- GET  /v1/actions                  — list staged tool-approval actions
+- GET  /v1/actions/{pending_id}     — staged-action detail
+- POST /v1/actions/{pending_id}/approve — approve a staged action (spawn exec card)
+- POST /v1/actions/{pending_id}/reject  — discard a staged action + archive its card
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -1192,6 +1196,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "actions": {"method": "GET", "path": "/v1/actions"},
+                "action_detail": {"method": "GET", "path": "/v1/actions/{pending_id}"},
+                "action_approve": {"method": "POST", "path": "/v1/actions/{pending_id}/approve"},
+                "action_reject": {"method": "POST", "path": "/v1/actions/{pending_id}/reject"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -4220,6 +4228,14 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_patch("/api/kanban/tasks/{task_id}", partial(kanban_api.handle_patch_task, self))
             self._app.router.add_post("/api/kanban/tasks/{task_id}/assign", partial(kanban_api.handle_assign_task, self))
             self._app.router.add_post("/api/kanban/tasks/{task_id}/comment", partial(kanban_api.handle_comment_task, self))
+            # Tool-approval action API (resolve deferred outbound actions over
+            # bearer auth). Handlers live in a dedicated module; profile-scoped
+            # (the pending store + one-shot replay are in this profile's home).
+            from gateway.platforms import actions_api
+            self._app.router.add_get("/v1/actions", partial(actions_api.handle_list_actions, self))
+            self._app.router.add_get("/v1/actions/{pending_id}", partial(actions_api.handle_get_action, self))
+            self._app.router.add_post("/v1/actions/{pending_id}/approve", partial(actions_api.handle_approve_action, self))
+            self._app.router.add_post("/v1/actions/{pending_id}/reject", partial(actions_api.handle_reject_action, self))
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
