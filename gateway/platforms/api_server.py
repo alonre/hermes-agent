@@ -28,6 +28,8 @@ Exposes an HTTP server with endpoints:
 - GET  /api/profiles                — list profiles on this host
 - POST /api/profiles                — create a new profile
 - POST /api/gateway/restart         — restart this gateway so a config write takes effect
+- GET  /api/soul                    — read a profile's SOUL.md (?profile= to target a sibling)
+- PUT  /api/soul                    — replace a profile's SOUL.md (backs up first; ?profile= to target a sibling)
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -4251,6 +4253,10 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/api/profiles", partial(config_api.handle_list_profiles, self))
             self._app.router.add_post("/api/profiles", partial(config_api.handle_create_profile, self))
             self._app.router.add_post("/api/gateway/restart", partial(config_api.handle_restart_gateway, self))
+            # SOUL.md read/write (capability-growth projection — Phase 6)
+            from gateway.platforms import soul_api
+            self._app.router.add_get("/api/soul", partial(soul_api.handle_get_soul, self))
+            self._app.router.add_put("/api/soul", partial(soul_api.handle_put_soul, self))
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
