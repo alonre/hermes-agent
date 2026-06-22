@@ -40,24 +40,36 @@ if git merge-base --is-ancestor upstream/main origin/main; then
   exit 0
 fi
 
+# gh resolves an unset default repo to the fork's *parent* (upstream), so PRs must
+# name the fork explicitly or `gh pr create` opens against upstream and fails.
+# Derive the fork's owner/repo from the origin remote (handles https and ssh URLs).
+FORK_REPO="$(git remote get-url origin)"
+FORK_REPO="${FORK_REPO#*github.com}"
+FORK_REPO="${FORK_REPO#[:/]}"
+FORK_REPO="${FORK_REPO%.git}"
+
 ORIGINAL_BRANCH="$(git branch --show-current)"
 SYNC_BRANCH="sync-upstream-$(date +%Y%m%d-%H%M%S)"
 
 git checkout -b "$SYNC_BRANCH" origin/main
 
 if git merge --no-edit upstream/main; then
+  # Push and open the PR before deleting the local branch, so a gh failure
+  # leaves the branch recoverable locally rather than stranded only on origin.
   git push -u origin "$SYNC_BRANCH"
-  git checkout "$ORIGINAL_BRANCH"
-  git branch -D "$SYNC_BRANCH"
 
   PR_URL="$(gh pr create \
+    --repo "$FORK_REPO" \
     --base main \
     --head "$SYNC_BRANCH" \
     --title "Sync upstream/main ($(date +%Y-%m-%d))" \
     --body "Automated sync from NousResearch/hermes-agent main. Merged automatically after a conflict-free local check.")"
 
+  git checkout "$ORIGINAL_BRANCH"
+  git branch -D "$SYNC_BRANCH"
+
   echo "Opened PR: $PR_URL"
-  gh pr merge "$PR_URL" --merge --delete-branch
+  gh pr merge "$PR_URL" --repo "$FORK_REPO" --merge --delete-branch
 
   echo "Merged into origin/main. Run 'hermes update' to pull, rebuild, and restart."
 else
@@ -65,15 +77,19 @@ else
   git checkout "$ORIGINAL_BRANCH"
   git branch -D "$SYNC_BRANCH"
 
+  # Push and open the PR before deleting the local branch, so a gh failure
+  # leaves the branch recoverable locally rather than stranded only on origin.
   git branch "$SYNC_BRANCH" upstream/main
   git push -u origin "$SYNC_BRANCH"
-  git branch -D "$SYNC_BRANCH"
 
   PR_URL="$(gh pr create \
+    --repo "$FORK_REPO" \
     --base main \
     --head "$SYNC_BRANCH" \
     --title "Sync upstream/main - CONFLICTS, needs manual resolution ($(date +%Y-%m-%d))" \
     --body "Automated sync from NousResearch/hermes-agent main hit merge conflicts with main. Resolve them in this PR: checkout $SYNC_BRANCH, merge main into it, fix the conflicts, push, then merge the PR yourself.")"
+
+  git branch -D "$SYNC_BRANCH"
 
   echo "error: upstream/main has conflicts with main; opened PR for manual resolution: $PR_URL" >&2
   exit 1
