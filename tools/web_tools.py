@@ -385,7 +385,22 @@ async def process_content_with_llm(
         if content_len < min_length:
             logger.debug("Content too short (%d < %d chars), skipping LLM processing", content_len, min_length)
             return None
-        
+
+        # Local-inference input cap (2026-06-21 eval): distilling a full large page
+        # through a local LLM on the M4 is impractically slow (gemma: ~77min on a
+        # 156k-char page) or OOM/compute-errors (a 30B aux can't coexist with the
+        # 35B main). Truncate the distiller input to a single fast call. For larger
+        # pages, use a more focused source URL or browser_navigate. Revisit when
+        # inference capacity grows (whole-page extract is a wanted future ability).
+        DISTILL_INPUT_CAP = 30_000  # chars sent to the summarizer (one quick call)
+        if content_len > DISTILL_INPUT_CAP:
+            logger.info(
+                "web_extract: capping distill input %d -> %d chars (local-inference cap)",
+                content_len, DISTILL_INPUT_CAP,
+            )
+            content = content[:DISTILL_INPUT_CAP]
+            content_len = DISTILL_INPUT_CAP
+
         # Create context information
         context_info = []
         if title:

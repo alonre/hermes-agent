@@ -19,6 +19,17 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- GET  /v1/actions                  — list staged tool-approval actions
+- GET  /v1/actions/{pending_id}     — staged-action detail
+- POST /v1/actions/{pending_id}/approve — approve a staged action (spawn exec card)
+- POST /v1/actions/{pending_id}/reject  — discard a staged action + archive its card
+- GET  /api/config                  — read a profile's config.yaml (?profile= to target a sibling)
+- PUT  /api/config                  — replace a profile's config.yaml (?profile= to target a sibling)
+- GET  /api/profiles                — list profiles on this host
+- POST /api/profiles                — create a new profile
+- POST /api/gateway/restart         — restart this gateway so a config write takes effect
+- GET  /api/soul                    — read a profile's SOUL.md (?profile= to target a sibling)
+- PUT  /api/soul                    — replace a profile's SOUL.md (backs up first; ?profile= to target a sibling)
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -1250,6 +1261,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
+                "kanban_api": True,
+                "kanban_read": True,
+                "kanban_write": True,
                 "audio_api": False,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
@@ -1267,6 +1281,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "actions": {"method": "GET", "path": "/v1/actions"},
+                "action_detail": {"method": "GET", "path": "/v1/actions/{pending_id}"},
+                "action_approve": {"method": "POST", "path": "/v1/actions/{pending_id}/approve"},
+                "action_reject": {"method": "POST", "path": "/v1/actions/{pending_id}/reject"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -1278,6 +1296,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "kanban_tasks": {"method": "GET", "path": "/api/kanban/tasks"},
+                "kanban_task_create": {"method": "POST", "path": "/api/kanban/tasks"},
+                "kanban_task": {"method": "GET", "path": "/api/kanban/tasks/{task_id}"},
+                "kanban_task_patch": {"method": "PATCH", "path": "/api/kanban/tasks/{task_id}"},
+                "kanban_task_assign": {"method": "POST", "path": "/api/kanban/tasks/{task_id}/assign"},
+                "kanban_task_comment": {"method": "POST", "path": "/api/kanban/tasks/{task_id}/comment"},
+                "kanban_assignees": {"method": "GET", "path": "/api/kanban/assignees"},
+                "kanban_dispatch_state": {"method": "GET", "path": "/api/kanban/dispatch/state"},
             },
         })
 
@@ -4417,6 +4443,41 @@ class APIServerAdapter(BasePlatformAdapter):
             # NAS-minted JWT (NOT API_SERVER_KEY), so it has its own auth path.
             if _CRON_AVAILABLE:
                 self._app.router.add_post("/api/cron/fire", self._handle_cron_fire)
+            # Kanban board API (read/write the shared kanban over bearer auth).
+            # Handlers live in a dedicated module; registered here so the
+            # change to this file is additive (import + routes only).
+            from functools import partial
+            from gateway.platforms import kanban_api
+            self._app.router.add_get("/api/kanban/tasks", partial(kanban_api.handle_list_tasks, self))
+            self._app.router.add_post("/api/kanban/tasks", partial(kanban_api.handle_create_task, self))
+            self._app.router.add_get("/api/kanban/assignees", partial(kanban_api.handle_assignees, self))
+            self._app.router.add_get("/api/kanban/dispatch/state", partial(kanban_api.handle_dispatch_state, self))
+            self._app.router.add_get("/api/kanban/tasks/{task_id}", partial(kanban_api.handle_get_task, self))
+            self._app.router.add_patch("/api/kanban/tasks/{task_id}", partial(kanban_api.handle_patch_task, self))
+            self._app.router.add_post("/api/kanban/tasks/{task_id}/assign", partial(kanban_api.handle_assign_task, self))
+            self._app.router.add_post("/api/kanban/tasks/{task_id}/comment", partial(kanban_api.handle_comment_task, self))
+            # Tool-approval action API (resolve deferred outbound actions over
+            # bearer auth). Handlers live in a dedicated module; profile-scoped
+            # (the pending store + one-shot replay are in this profile's home).
+            from gateway.platforms import actions_api
+            self._app.router.add_get("/v1/actions", partial(actions_api.handle_list_actions, self))
+            self._app.router.add_get("/v1/actions/{pending_id}", partial(actions_api.handle_get_action, self))
+            self._app.router.add_post("/v1/actions/{pending_id}/approve", partial(actions_api.handle_approve_action, self))
+            self._app.router.add_post("/v1/actions/{pending_id}/reject", partial(actions_api.handle_reject_action, self))
+            # Config + profile API (read/write config.yaml, list/create profiles,
+            # reload the gateway) over bearer auth — lets the master console drive
+            # capability provisioning through one API instead of the dashboard's
+            # session auth. Handlers live in a dedicated module; additive here.
+            from gateway.platforms import config_api
+            self._app.router.add_get("/api/config", partial(config_api.handle_get_config, self))
+            self._app.router.add_put("/api/config", partial(config_api.handle_put_config, self))
+            self._app.router.add_get("/api/profiles", partial(config_api.handle_list_profiles, self))
+            self._app.router.add_post("/api/profiles", partial(config_api.handle_create_profile, self))
+            self._app.router.add_post("/api/gateway/restart", partial(config_api.handle_restart_gateway, self))
+            # SOUL.md read/write (capability-growth projection — Phase 6)
+            from gateway.platforms import soul_api
+            self._app.router.add_get("/api/soul", partial(soul_api.handle_get_soul, self))
+            self._app.router.add_put("/api/soul", partial(soul_api.handle_put_soul, self))
             # Structured event streaming
             self._app.router.add_post("/v1/runs", self._handle_runs)
             self._app.router.add_get("/v1/runs/{run_id}", self._handle_get_run)
