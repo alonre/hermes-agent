@@ -111,6 +111,35 @@ def _profile_home(profile: Optional[str]):
         reset_hermes_home_override(token)
 
 
+def _seed_api_server_env(profile_path: Any, port: int, key: str) -> None:
+    """Append API_SERVER_* settings to a freshly created profile's ``.env``.
+
+    ``create_profile`` seeds an empty, 0600 ``.env``; we add the three lines that
+    bring up the profile's own bearer API server on ``port`` with the shared
+    ``key``. Any pre-existing ``API_SERVER_*`` lines are dropped first so a retry
+    is idempotent rather than appending duplicates.
+    """
+    from pathlib import Path
+
+    env_path = Path(profile_path) / ".env"
+    existing = ""
+    if env_path.exists():
+        existing = env_path.read_text(encoding="utf-8")
+    kept = [
+        ln for ln in existing.splitlines()
+        if not ln.lstrip().startswith(("API_SERVER_ENABLED", "API_SERVER_PORT", "API_SERVER_KEY"))
+    ]
+    body = "\n".join(kept).rstrip("\n")
+    block = (
+        "# API server — seeded at profile creation so the control plane can reach it.\n"
+        "API_SERVER_ENABLED=true\n"
+        f"API_SERVER_PORT={port}\n"
+        f"API_SERVER_KEY={key}\n"
+    )
+    env_path.write_text((body + "\n\n" if body else "") + block, encoding="utf-8")
+    os.chmod(str(env_path), 0o600)
+
+
 def _profile_summary(info: Any) -> Dict[str, Any]:
     """Serialize a ``hermes_cli.profiles.ProfileInfo`` to JSON-safe fields."""
     return {
@@ -229,10 +258,16 @@ async def handle_create_profile(adapter, request: "web.Request") -> "web.Respons
     """POST /api/profiles — create a new profile directory.
 
     Body: ``{"name": <str>, "clone_from"?: <str>, "clone_config"?: <bool>,
-    "no_skills"?: <bool>, "no_alias"?: <bool>, "description"?: <str>}``.
-    Wraps ``hermes_cli.profiles.create_profile`` so directory layout, name
-    validation, and skill seeding match a CLI-created profile exactly. Set the
-    new profile's tools/skills/model afterward via ``PUT /api/config?profile=``.
+    "no_skills"?: <bool>, "no_alias"?: <bool>, "description"?: <str>,
+    "api_server_port"?: <int>}``. Wraps ``hermes_cli.profiles.create_profile``
+    so directory layout, name validation, and skill seeding match a
+    CLI-created profile exactly. Set the new profile's tools/skills/model
+    afterward via ``PUT /api/config?profile=``.
+
+    When ``api_server_port`` is given, the new profile's ``.env`` is seeded with
+    ``API_SERVER_ENABLED``/``API_SERVER_PORT``/``API_SERVER_KEY`` (the shared key
+    of this running server) so ``POST /api/gateway/start`` can bring up a gateway
+    the control plane can reach on that port.
     """
     auth_err = adapter._check_auth(request)
     if auth_err:
@@ -258,6 +293,22 @@ async def handle_create_profile(adapter, request: "web.Request") -> "web.Respons
     no_skills = bool(body.get("no_skills", False))
     no_alias = bool(body.get("no_alias", False))
 
+    # Optional: seed the new profile's own API server so a control plane can
+    # reach it on a dedicated port right after creation. Without this the
+    # profile's .env has no API_SERVER_* and its gateway would expose nothing.
+    api_server_port = body.get("api_server_port")
+    if api_server_port is not None:
+        if isinstance(api_server_port, bool) or not isinstance(api_server_port, int):
+            return _err("'api_server_port' must be an integer", status=400,
+                        code="invalid_api_server_port", param="api_server_port")
+        if not (1024 <= api_server_port <= 65535):
+            return _err("'api_server_port' must be in 1024-65535", status=400,
+                        code="invalid_api_server_port", param="api_server_port")
+        if api_server_port == adapter._port:
+            return _err(f"'api_server_port' {api_server_port} collides with this "
+                        "server's port", status=400,
+                        code="invalid_api_server_port", param="api_server_port")
+
     def _create():
         from hermes_cli.profiles import create_profile, normalize_profile_name
         path = create_profile(
@@ -280,7 +331,24 @@ async def handle_create_profile(adapter, request: "web.Request") -> "web.Respons
         logger.exception("POST /api/profiles failed")
         return _err("Failed to create profile", status=500, code="server_error")
 
-    return web.json_response({"ok": True, "profile": canon, "path": str(path)}, status=201)
+    result: Dict[str, Any] = {"ok": True, "profile": canon, "path": str(path)}
+
+    if api_server_port is not None:
+        # Append the API-server settings to the profile's .env (create_profile
+        # seeds an empty, 0600 .env). The shared bearer key is read from THIS
+        # running server (adapter._api_key) so the whole fleet authenticates
+        # with one key — same value the console already holds.
+        try:
+            await asyncio.to_thread(
+                _seed_api_server_env, path, api_server_port, adapter._api_key
+            )
+            result["api_server_port"] = api_server_port
+        except Exception:
+            logger.exception("Seeding API-server env for '%s' failed", canon)
+            return _err("Profile created but seeding its API-server env failed",
+                        status=500, code="env_seed_failed")
+
+    return web.json_response(result, status=201)
 
 
 # ---------------------------------------------------------------------------
@@ -317,3 +385,89 @@ async def handle_restart_gateway(adapter, request: "web.Request") -> "web.Respon
         return _err("Failed to restart gateway", status=500, code="server_error")
 
     return web.json_response({"ok": True, "pid": pid, "name": "gateway-restart"})
+
+
+async def handle_start_gateway(adapter, request: "web.Request") -> "web.Response":
+    """POST /api/gateway/start — start (or restart) a *named* sibling profile's gateway.
+
+    Body: ``{"profile": <name>}``. Unlike ``/api/gateway/restart`` (which bounces
+    THIS server's own gateway), this brings up a different profile's gateway by
+    spawning a detached ``hermes gateway restart`` with ``HERMES_HOME`` pointed at
+    that profile's directory — the only way to start the API server of a
+    freshly created profile that isn't running yet. ``restart`` is start-or-
+    restart safe, so the call is idempotent. Refuses ``default`` (its home is the
+    root ``~/.hermes``; restart its own server instead) and 404s on an unknown
+    profile, mirroring ``_profile_home``.
+    """
+    auth_err = adapter._check_auth(request)
+    if auth_err:
+        return auth_err
+
+    body, err = await adapter._read_json_body(request)
+    if err:
+        return err
+
+    name = body.get("profile")
+    if not isinstance(name, str) or not name.strip():
+        return _err("'profile' is required", status=400, code="missing_profile", param="profile")
+
+    def _resolve():
+        from hermes_cli.profiles import (
+            normalize_profile_name,
+            validate_profile_name,
+            get_profile_dir,
+        )
+        canon = normalize_profile_name(name)
+        if canon == "default":
+            raise _ProfileTargetError(
+                "Refusing to start the 'default' profile by name; restart its own "
+                "gateway via POST /api/gateway/restart instead."
+            )
+        validate_profile_name(canon)
+        profile_dir = get_profile_dir(canon)
+        if not profile_dir.is_dir():
+            raise _ProfileTargetError(
+                f"Profile '{canon}' does not exist", status=404, code="profile_not_found"
+            )
+        return canon, profile_dir
+
+    try:
+        canon, profile_dir = await asyncio.to_thread(_resolve)
+    except _ProfileTargetError as exc:
+        return _err(exc.message, status=exc.status, code=exc.code, param="profile")
+    except Exception as exc:  # validate_profile_name raises on bad names
+        return _err(f"Invalid profile name: {exc}", status=400,
+                    code="invalid_profile", param="profile")
+
+    def _spawn() -> int:
+        # `gateway run --replace` (not `restart`): start-or-take-over, so it
+        # brings up a profile whose gateway has never run — `restart` no-ops
+        # when there's no PID to bounce. HERMES_HOME selects the profile (the
+        # CLI derives `--profile` from it). Mirrors the codebase's own detached
+        # fallback `_spawn_detached_gateway` / `_gateway_run_command`. Boot
+        # output goes to the profile's gateway logs so failures aren't swallowed.
+        log_dir = profile_dir / "logs"
+        log_dir.mkdir(parents=True, exist_ok=True)
+        out = open(log_dir / "gateway.log", "ab")
+        err = open(log_dir / "gateway.error.log", "ab")
+        try:
+            proc = subprocess.Popen(
+                [sys.executable, "-m", "hermes_cli.main", "gateway", "run", "--replace"],
+                stdin=subprocess.DEVNULL,
+                stdout=out,
+                stderr=err,
+                start_new_session=True,
+                env={**os.environ, "HERMES_NONINTERACTIVE": "1", "HERMES_HOME": str(profile_dir)},
+            )
+        finally:
+            out.close()
+            err.close()
+        return proc.pid
+
+    try:
+        pid = await asyncio.to_thread(_spawn)
+    except Exception:
+        logger.exception("POST /api/gateway/start failed")
+        return _err("Failed to start gateway", status=500, code="server_error")
+
+    return web.json_response({"ok": True, "pid": pid, "profile": canon})

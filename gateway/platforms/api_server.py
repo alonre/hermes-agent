@@ -26,8 +26,9 @@ Exposes an HTTP server with endpoints:
 - GET  /api/config                  — read a profile's config.yaml (?profile= to target a sibling)
 - PUT  /api/config                  — replace a profile's config.yaml (?profile= to target a sibling)
 - GET  /api/profiles                — list profiles on this host
-- POST /api/profiles                — create a new profile
+- POST /api/profiles                — create a new profile (optional api_server_port seeds its .env)
 - POST /api/gateway/restart         — restart this gateway so a config write takes effect
+- POST /api/gateway/start           — start/restart a named sibling profile's gateway (body: {profile})
 - GET  /api/soul                    — read a profile's SOUL.md (?profile= to target a sibling)
 - PUT  /api/soul                    — replace a profile's SOUL.md (backs up first; ?profile= to target a sibling)
 - GET  /health                     — health check
@@ -4474,6 +4475,7 @@ class APIServerAdapter(BasePlatformAdapter):
             self._app.router.add_get("/api/profiles", partial(config_api.handle_list_profiles, self))
             self._app.router.add_post("/api/profiles", partial(config_api.handle_create_profile, self))
             self._app.router.add_post("/api/gateway/restart", partial(config_api.handle_restart_gateway, self))
+            self._app.router.add_post("/api/gateway/start", partial(config_api.handle_start_gateway, self))
             # SOUL.md read/write (capability-growth projection — Phase 6)
             from gateway.platforms import soul_api
             self._app.router.add_get("/api/soul", partial(soul_api.handle_get_soul, self))
