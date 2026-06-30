@@ -121,9 +121,15 @@ if git merge --no-edit upstream/main; then
   git branch -D "$SYNC_BRANCH"
 
   echo "Opened PR: $PR_URL"
-  gh pr merge "$PR_URL" --repo "$FORK_REPO" --merge --delete-branch
+  # main is branch-protected: it requires the "All required checks pass" CI
+  # aggregate before anything can merge. Enable auto-merge instead of an
+  # immediate merge (which would fail while checks are still pending) — the PR
+  # lands by itself once CI is green, and stays open (fail-closed) if CI is red,
+  # so a regression never reaches the live fleet unattended.
+  gh pr merge "$PR_URL" --repo "$FORK_REPO" --merge --auto --delete-branch
 
-  echo "Merged into origin/main. Run 'hermes update' to pull, rebuild, and restart."
+  echo "Auto-merge enabled; PR will merge once CI ('All required checks pass') is green."
+  echo "The merge is asynchronous — run 'hermes update' after it lands (e.g. next nightly cycle) to pull, rebuild, and restart."
 else
   git merge --abort
   git checkout "$ORIGINAL_BRANCH"
