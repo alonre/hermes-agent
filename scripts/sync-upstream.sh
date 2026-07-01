@@ -72,8 +72,13 @@ check_fork_invariants() {
   local violated=0 entry symbol files why
   for entry in "${FORK_INVARIANTS[@]}"; do
     IFS='|' read -r symbol files why <<<"$entry"
+    # Match the symbol, but drop hits on comment-only lines: these files carry
+    # explanatory comments that name the forbidden symbol (e.g. cron/jobs.py's
+    # "...NOT get_default_hermes_root()"), and a raw match would false-trip on
+    # that prose on every clean sync. The `grep -v` filters `file:lineno:` rows
+    # whose code starts with `#`; only real code re-introductions survive.
     # shellcheck disable=SC2086 — $files is an intentional space-separated list.
-    if grep -nF "$symbol" $files 2>/dev/null; then
+    if grep -nF "$symbol" $files 2>/dev/null | grep -vE '^[^:]+:[0-9]+:[[:space:]]*#'; then
       echo "  ^ FORK INVARIANT VIOLATED: '$symbol' reappeared — $why" >&2
       violated=1
     fi
