@@ -2578,7 +2578,10 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+from gateway.platforms._wa_bridging import WABridgeMixin as _WABridgeMixin
+
+
+class GatewayRunner(_WABridgeMixin, GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
 
@@ -2782,12 +2785,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
 
-        # WhatsApp self-send bridging: when an approval prompt for a bridged
-        # WhatsApp session is redirected to the Telegram home channel, map
-        # the Telegram session's key -> the WhatsApp session's key so
-        # /approve and /deny typed in Telegram resolve the right queue.
-        # Key: bridge (Telegram) session_key, Value: actual (WhatsApp) session_key
-        self._wa_bridge_approval_redirects: Dict[str, str] = {}
+        self._init_wa_bridge_state()  # WABridgeMixin: approval-redirect dict + bridge state
 
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
@@ -8369,28 +8367,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
-    def _whatsapp_bridge_target(self, source: SessionSource):
-        """Return (wa_adapter, tg_adapter, tg_chat_id) if WhatsApp self-send
-        bridging applies to ``source``, else None.
+    # ------------------------------------------------------------------
+    # Bridge hook virtual methods (no-ops; overridden by WABridgeMixin)
+    # ------------------------------------------------------------------
+    # These methods are called at message-handling boundaries so that
+    # platform-specific bridge logic (e.g. WhatsApp → Telegram relay) can be
+    # injected via a mixin without touching the core flow. With no bridge
+    # active, every method is a no-op / identity function.
 
-        WhatsApp suppresses phone notifications for messages "from yourself",
-        so a message sent in a WhatsApp self-chat (DM to your own number)
-        never alerts the user. When ``whatsapp_bridging`` is enabled, those
-        replies are routed through the Telegram home channel instead.
-        """
-        if source.platform != Platform.WHATSAPP or not source.user_id:
-            return None
-        if source.user_id != source.chat_id:
-            return None
-        wa_cfg = self.config.platforms.get(Platform.WHATSAPP)
-        if not wa_cfg or not wa_cfg.extra.get("whatsapp_bridging"):
-            return None
-        wa_adapter = self.adapters.get(Platform.WHATSAPP)
-        tg_adapter = self.adapters.get(Platform.TELEGRAM)
-        tg_home = self.config.get_home_channel(Platform.TELEGRAM)
-        if not wa_adapter or not tg_adapter or not tg_home:
-            return None
-        return wa_adapter, tg_adapter, tg_home.chat_id
+    def _init_wa_bridge_state(self) -> None:
+        pass  # overridden by WABridgeMixin
+
+    async def _pre_agent(self, event: MessageEvent, source: SessionSource) -> None:
+        pass
+
+    async def _on_agent_error(self, event: MessageEvent, source: SessionSource) -> None:
+        pass
+
+    async def _post_agent(self, event: MessageEvent, source: SessionSource, agent_result):
+        return agent_result
+
+    def _bridged(self, source: SessionSource, default_adapter, default_chat_id: str) -> tuple:
+        return default_adapter, default_chat_id
+
+    def _bridge_session_key_for_source(self, source: SessionSource):
+        return None
+
+    def _register_bridge_approval(self, bridge_session_key, approval_session_key: str) -> None:
+        pass
+
+    def _unregister_bridge_approval(self, bridge_session_key) -> None:
+        pass
+
+    def _apply_bridge_progress_context(self, source: SessionSource, thread_id, metadata, reply_to) -> tuple:
+        return thread_id, metadata, reply_to
+
+    def _apply_bridge_status_target(self, source: SessionSource, status_adapter, status_chat_id: str, status_metadata) -> tuple:
+        return status_adapter, status_chat_id, status_metadata
 
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
@@ -9747,34 +9760,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
-        # WhatsApp self-send bridging: ack the self-chat message with a
-        # "still working" reaction up front so the user sees Hermes picked
-        # it up, even though the eventual reply won't go back over WhatsApp.
-        _wa_bridge = self._whatsapp_bridge_target(source)
-        if _wa_bridge:
-            _wa_adapter, _, _ = _wa_bridge
-            try:
-                await _wa_adapter.send_reaction(source.chat_id, event.message_id, "\U0001F576")  # 🕶️
-            except Exception:
-                logger.debug("WhatsApp bridging: failed to send ack reaction", exc_info=True)
-
+        await self._pre_agent(event, source)
         try:
             try:
                 _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
             except Exception:
-                if _wa_bridge:
-                    _wa_adapter, _, _ = _wa_bridge
-                    try:
-                        await _wa_adapter.send_reaction(source.chat_id, event.message_id, "❌")
-                    except Exception:
-                        logger.debug("WhatsApp bridging: failed to send error reaction", exc_info=True)
+                await self._on_agent_error(event, source)
                 raise
-
-            _final_text = ""
-            if isinstance(_agent_result, dict):
-                _final_text = str(_agent_result.get("final_response") or "")
-            elif isinstance(_agent_result, str):
-                _final_text = _agent_result
 
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
@@ -9783,6 +9775,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # next turn makes more progress. Wrapped in try/except so a
             # broken judge never breaks normal message handling.
             try:
+                _final_text = ""
+                if isinstance(_agent_result, dict):
+                    _final_text = str(_agent_result.get("final_response") or "")
+                elif isinstance(_agent_result, str):
+                    _final_text = _agent_result
                 # Skip for empty responses (interrupted / errored) — the
                 # judge would almost always say "continue" and we'd loop
                 # on error. Let the user drive the next turn.
@@ -9800,40 +9797,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
 
-            if _wa_bridge:
-                _wa_adapter, _tg_adapter, _tg_chat_id = _wa_bridge
-                _ack_emoji = "❌"
-                _already_sent_to_tg = bool(
-                    isinstance(_agent_result, dict) and _agent_result.get("already_sent")
-                )
-                if _final_text.strip():
-                    if _already_sent_to_tg:
-                        # The stream consumer / interim-assistant callback was
-                        # already redirected to Telegram during the run and
-                        # delivered this text — avoid sending it twice.
-                        _ack_emoji = "\U0001F44D"  # 👍
-                    else:
-                        _quote = (event.text or "").strip()
-                        if len(_quote) > 500:
-                            _quote = _quote[:500] + "…"
-                        _bridge_text = f"[WhatsApp] {_quote}\n\n{_final_text}"
-                        try:
-                            _tg_result = await _tg_adapter.send(_tg_chat_id, _bridge_text)
-                            if getattr(_tg_result, "success", False):
-                                _ack_emoji = "\U0001F44D"  # 👍
-                        except Exception:
-                            logger.exception("WhatsApp bridging: Telegram delivery failed")
-                else:
-                    # Nothing to relay — clear the "still working" reaction so
-                    # it doesn't linger forever.
-                    _ack_emoji = "\U0001F44D"  # 👍
-                try:
-                    await _wa_adapter.send_reaction(source.chat_id, event.message_id, _ack_emoji)
-                except Exception:
-                    logger.debug("WhatsApp bridging: failed to send result reaction", exc_info=True)
-                return None
-
-            return _agent_result
+            return await self._post_agent(event, source, _agent_result)
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
@@ -16099,34 +16063,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         needs_progress_queue = tool_progress_enabled or _thinking_enabled
 
-        # WhatsApp self-send bridging: when active, ALL outbound traffic for
-        # this turn — tool progress, status/heartbeat updates, interim
-        # assistant ("thinking") messages, clarify prompts, and approval
-        # requests — is redirected to the Telegram home channel instead of
-        # the WhatsApp self-chat, which never triggers a phone notification.
-        # The final response + reaction lifecycle is handled separately by
-        # _handle_message via _whatsapp_bridge_target().
-        _wa_bridge_run = self._whatsapp_bridge_target(source)
-        if _wa_bridge_run:
-            _, _bridge_adapter, _bridge_chat_id = _wa_bridge_run
-            # Session key /approve and /deny resolve to when typed in the
-            # Telegram home channel — needed so approval prompts redirected
-            # there can still be actioned (see _wa_bridge_approval_redirects
-            # near register_gateway_notify below).
-            _bridge_session_key = self._session_key_for_source(
-                SessionSource(platform=Platform.TELEGRAM, chat_id=_bridge_chat_id, chat_type="dm")
-            )
-        else:
-            _bridge_adapter = None
-            _bridge_chat_id = None
-            _bridge_session_key = None
-
-        def _bridged(default_adapter, default_chat_id):
-            """Resolve (adapter, chat_id) for an outbound send, redirecting
-            to the Telegram home channel when WhatsApp bridging is active."""
-            if _bridge_adapter is not None:
-                return _bridge_adapter, _bridge_chat_id
-            return default_adapter, default_chat_id
+        # Session key for the bridge channel's /approve and /deny resolution.
+        # Non-None only when WhatsApp self-send bridging is active; WABridgeMixin
+        # overrides _bridge_session_key_for_source to return the Telegram home
+        # channel session key so commands typed there can resolve WA approvals.
+        _bridge_session_key = self._bridge_session_key_for_source(source)
 
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if needs_progress_queue else None
@@ -16189,7 +16130,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             resolve_display_setting(user_config, platform_key, "cleanup_progress")
         )
         _cleanup_adapter, _cleanup_chat_id = (
-            _bridged(self.adapters.get(source.platform), source.chat_id)
+            self._bridged(source, self.adapters.get(source.platform), source.chat_id)
             if _cleanup_progress
             else (None, None)
         )
@@ -16433,18 +16374,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
             else None
         )
-        if _bridge_adapter is not None:
-            # Telegram home channel is a flat DM — drop WhatsApp-specific
-            # threading/reply targets when redirecting progress there.
-            _progress_thread_id = None
-            _progress_metadata = None
-            _progress_reply_to = None
+        _progress_thread_id, _progress_metadata, _progress_reply_to = (
+            self._apply_bridge_progress_context(source, _progress_thread_id, _progress_metadata, _progress_reply_to)
+        )
 
         async def send_progress_messages():
             if not progress_queue:
                 return
 
-            adapter, _chat_id = _bridged(self.adapters.get(source.platform), source.chat_id)
+            adapter, _chat_id = self._bridged(source, self.adapters.get(source.platform), source.chat_id)
             if not adapter:
                 return
 
@@ -16833,13 +16771,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 
-        if _bridge_adapter is not None:
-            # Redirect status updates, interim "thinking" messages, clarify
-            # prompts, and approval requests to the Telegram home channel —
-            # WhatsApp self-chat messages never trigger a phone notification.
-            _status_adapter = _bridge_adapter
-            _status_chat_id = _bridge_chat_id
-            _status_thread_metadata = None
+        _status_adapter, _status_chat_id, _status_thread_metadata = (
+            self._apply_bridge_status_target(source, _status_adapter, _status_chat_id, _status_thread_metadata)
+        )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -16966,7 +16900,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _want_stream_deltas or _want_interim_consumer:
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-                    _adapter, _sc_chat_id = _bridged(self.adapters.get(source.platform), source.chat_id)
+                    _adapter, _sc_chat_id = self._bridged(source, self.adapters.get(source.platform), source.chat_id)
                     if _adapter:
                         _pause_typing_before_finalize = None
                         if source.platform == Platform.TELEGRAM and hasattr(_adapter, "pause_typing_for_chat"):
@@ -17747,11 +17681,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
-            if _bridge_session_key is not None:
-                # Approval prompts for this session are redirected to the
-                # Telegram home channel — let /approve and /deny typed there
-                # resolve this (WhatsApp) session's pending approvals too.
-                self._wa_bridge_approval_redirects[_bridge_session_key] = _approval_session_key
+            self._register_bridge_approval(_bridge_session_key, _approval_session_key)
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -17803,8 +17733,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
-                if _bridge_session_key is not None:
-                    self._wa_bridge_approval_redirects.pop(_bridge_session_key, None)
+                self._unregister_bridge_approval(_bridge_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.
@@ -18158,10 +18087,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         )
                                         pending_text = _enriched
                                         if _transcripts:
-                                            _echo_adapter, _echo_chat_id = _bridged(_adapter, source.chat_id)
+                                            _echo_adapter, _echo_chat_id = self._bridged(source, _adapter, source.chat_id)
                                             _echo_meta = (
                                                 None
-                                                if _bridge_adapter is not None
+                                                if _echo_chat_id != source.chat_id
                                                 else ({"thread_id": source.thread_id} if source.thread_id else None)
                                             )
                                             for _tx in _transcripts:
@@ -18214,7 +18143,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
-            _notify_adapter, _notify_chat_id = _bridged(self.adapters.get(source.platform), source.chat_id)
+            _notify_adapter, _notify_chat_id = self._bridged(source, self.adapters.get(source.platform), source.chat_id)
             if not _notify_adapter:
                 return
             # Track the heartbeat message id so we can edit-in-place on
@@ -18395,7 +18324,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if (not _warning_fired and _agent_warning is not None
                             and _idle_secs >= _agent_warning):
                         _warning_fired = True
-                        _warn_adapter, _warn_chat_id = _bridged(self.adapters.get(source.platform), source.chat_id)
+                        _warn_adapter, _warn_chat_id = self._bridged(source, self.adapters.get(source.platform), source.chat_id)
                         if _warn_adapter:
                             _elapsed_warn = int(_agent_warning // 60) or 1
                             _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
@@ -18583,10 +18512,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                             pending = _enriched or None
                             if _transcripts:
-                                _echo_adapter, _echo_chat_id = _bridged(adapter, source.chat_id)
+                                _echo_adapter, _echo_chat_id = self._bridged(source, adapter, source.chat_id)
                                 _echo_meta = (
                                     None
-                                    if _bridge_adapter is not None
+                                    if _echo_chat_id != source.chat_id
                                     else ({"thread_id": source.thread_id} if source.thread_id else None)
                                 )
                                 for _tx in _transcripts:
@@ -18705,7 +18634,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            _first_resp_adapter, _first_resp_chat_id = _bridged(adapter, source.chat_id)
+                            _first_resp_adapter, _first_resp_chat_id = self._bridged(source, adapter, source.chat_id)
                             await _first_resp_adapter.send(
                                 _first_resp_chat_id,
                                 first_response,
@@ -18773,7 +18702,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
                 # typing task is still alive but may be stale.
-                _followup_adapter, _followup_chat_id = _bridged(self.adapters.get(source.platform), source.chat_id)
+                _followup_adapter, _followup_chat_id = self._bridged(source, self.adapters.get(source.platform), source.chat_id)
                 if _followup_adapter:
                     try:
                         await _followup_adapter.send_typing(
@@ -18925,7 +18854,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _sc_msg_id:
                     try:
                         await _sc.adapter.edit_message(
-                            chat_id=(_bridge_chat_id if _bridge_adapter is not None else source.chat_id),
+                            chat_id=self._bridged(source, _sc.adapter, source.chat_id)[1],
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
