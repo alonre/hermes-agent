@@ -8367,47 +8367,6 @@ class GatewayRunner(_WABridgeMixin, GatewayAuthorizationMixin, GatewayKanbanWatc
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
-    # ------------------------------------------------------------------
-    # Bridge hook virtual methods (no-ops; overridden by WABridgeMixin)
-    # ------------------------------------------------------------------
-    # These methods are called at message-handling boundaries so that
-    # platform-specific bridge logic (e.g. WhatsApp → Telegram relay) can be
-    # injected via a mixin without touching the core flow. With no bridge
-    # active, every method is a no-op / identity function.
-
-    def _init_wa_bridge_state(self) -> None:
-        pass  # overridden by WABridgeMixin
-
-    async def _pre_agent(self, event: MessageEvent, source: SessionSource) -> None:
-        pass
-
-    async def _on_agent_error(self, event: MessageEvent, source: SessionSource) -> None:
-        pass
-
-    async def _post_agent(self, event: MessageEvent, source: SessionSource, agent_result):
-        return agent_result
-
-    def _bridged(self, source: SessionSource, default_adapter, default_chat_id: str) -> tuple:
-        return default_adapter, default_chat_id
-
-    def _bridge_session_key_for_source(self, source: SessionSource):
-        return None
-
-    def _register_bridge_approval(self, bridge_session_key, approval_session_key: str) -> None:
-        pass
-
-    def _unregister_bridge_approval(self, bridge_session_key) -> None:
-        pass
-
-    def _apply_bridge_progress_context(self, source: SessionSource, thread_id, metadata, reply_to) -> tuple:
-        return thread_id, metadata, reply_to
-
-    def _apply_bridge_status_target(self, source: SessionSource, status_adapter, status_chat_id: str, status_metadata) -> tuple:
-        return status_adapter, status_chat_id, status_metadata
-
-    def _resolve_approval_session_key(self, session_key: str) -> str:
-        return session_key
-
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.

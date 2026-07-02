@@ -68,7 +68,7 @@ class WABridgeMixin:
     def _whatsapp_bridge_target(self, source: "SessionSource"):
         """Return (wa_adapter, tg_adapter, tg_chat_id) if bridging applies, else None."""
         try:
-            from hermes_cli.platforms import Platform
+            from gateway.config import Platform
         except ImportError:
             return None
         if source.platform != Platform.WHATSAPP or not source.user_id:
@@ -192,7 +192,7 @@ class WABridgeMixin:
             return None
         _, _, tg_chat_id = _wa_bridge
         try:
-            from hermes_cli.platforms import Platform
+            from gateway.config import Platform
             from hermes_cli.session_source import SessionSource as _SS
         except ImportError:
             return None
