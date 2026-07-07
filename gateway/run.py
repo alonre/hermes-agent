@@ -2714,7 +2714,10 @@ async def _dispose_unused_adapter(adapter: "BasePlatformAdapter | None") -> None
         )
 
 
-class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
+from gateway.platforms._wa_bridging import WABridgeMixin as _WABridgeMixin
+
+
+class GatewayRunner(_WABridgeMixin, GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
 
@@ -2917,6 +2920,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
         self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+
+        self._init_wa_bridge_state()  # WABridgeMixin: approval-redirect dict + bridge state
 
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
@@ -10034,8 +10039,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        await self._pre_agent(event, source)
         try:
-            _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            try:
+                _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            except Exception:
+                await self._on_agent_error(event, source)
+                raise
+
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -10064,7 +10075,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
-            return _agent_result
+
+            return await self._post_agent(event, source, _agent_result)
         finally:
             # MoA one-shot restore must run on EVERY exit path, not just
             # success. The restore data lives on the per-turn event object
@@ -16637,6 +16649,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _thinking_enabled = _thinking_mode != "off"
         needs_progress_queue = tool_progress_enabled or _thinking_enabled
 
+        # Session key for the bridge channel's /approve and /deny resolution.
+        # Non-None only when WhatsApp self-send bridging is active; WABridgeMixin
+        # overrides _bridge_session_key_for_source to return the Telegram home
+        # channel session key so commands typed there can resolve WA approvals.
+        _bridge_session_key = self._bridge_session_key_for_source(source)
 
         # Queue for progress messages (thread-safe)
         progress_queue = queue.Queue() if needs_progress_queue else None
@@ -16698,7 +16715,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _cleanup_progress = bool(
             resolve_display_setting(user_config, platform_key, "cleanup_progress")
         )
-        _cleanup_adapter = self.adapters.get(source.platform) if _cleanup_progress else None
+        _cleanup_adapter, _cleanup_chat_id = (
+            self._bridged(source, self.adapters.get(source.platform), source.chat_id)
+            if _cleanup_progress
+            else (None, None)
+        )
         if _cleanup_adapter is not None and (
             type(_cleanup_adapter).delete_message is BasePlatformAdapter.delete_message
         ):
@@ -16949,6 +16970,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
             else None
         )
+        _progress_thread_id, _progress_metadata, _progress_reply_to = (
+            self._apply_bridge_progress_context(source, _progress_thread_id, _progress_metadata, _progress_reply_to)
+        )
 
         async def write_tool_log():
             """Drain log_queue and append tool-call lines to tool_calls.log.
@@ -17009,7 +17033,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if not progress_queue:
                 return
 
-            adapter = self.adapters.get(source.platform)
+            adapter, _chat_id = self._bridged(source, self.adapters.get(source.platform), source.chat_id)
             if not adapter:
                 return
 
@@ -17064,7 +17088,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             async def _edit_progress_message(message_id: str, content: str):
                 kwargs = {
-                    "chat_id": source.chat_id,
+                    "chat_id": _chat_id,
                     "message_id": message_id,
                     "content": content,
                 }
@@ -17102,7 +17126,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             async def _send_progress_text(text: str):
                 result = await adapter.send(
-                    chat_id=source.chat_id,
+                    chat_id=_chat_id,
                     content=text,
                     reply_to=_progress_reply_to,
                     metadata=_progress_metadata,
@@ -17202,7 +17226,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _last_edit_ts = time.monotonic()
                         await asyncio.sleep(0.3)
                         if _run_still_current():
-                            await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                            await adapter.send_typing(_chat_id, metadata=_progress_metadata)
                         continue
 
                     # Throttle edits: batch rapid tool updates into fewer
@@ -17249,7 +17273,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             else:
                                 can_edit = False
                             _flood_result = await adapter.send(
-                                chat_id=source.chat_id,
+                                chat_id=_chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
                                 metadata=_progress_metadata,
@@ -17265,7 +17289,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             # First tool: send all accumulated text as new message
                             full_text = "\n".join(progress_lines)
                             result = await adapter.send(
-                                chat_id=source.chat_id,
+                                chat_id=_chat_id,
                                 content=full_text,
                                 reply_to=_progress_reply_to,
                                 metadata=_progress_metadata,
@@ -17273,7 +17297,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         else:
                             # Editing unsupported: send just this line
                             result = await adapter.send(
-                                chat_id=source.chat_id,
+                                chat_id=_chat_id,
                                 content=msg,
                                 reply_to=_progress_reply_to,
                                 metadata=_progress_metadata,
@@ -17288,7 +17312,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Restore typing indicator
                     await asyncio.sleep(0.3)
                     if _run_still_current():
-                        await adapter.send_typing(source.chat_id, metadata=_progress_metadata)
+                        await adapter.send_typing(_chat_id, metadata=_progress_metadata)
 
                 except queue.Empty:
                     await asyncio.sleep(0.3)
@@ -17397,6 +17421,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             }
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
+
+        _status_adapter, _status_chat_id, _status_thread_metadata = (
+            self._apply_bridge_status_target(source, _status_adapter, _status_chat_id, _status_thread_metadata)
+        )
 
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
@@ -17530,7 +17558,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _want_stream_deltas or _want_interim_consumer:
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
-                    _adapter = self.adapters.get(source.platform)
+                    _adapter, _sc_chat_id = self._bridged(source, self.adapters.get(source.platform), source.chat_id)
                     if _adapter:
                         _pause_typing_before_finalize = None
                         if source.platform == Platform.TELEGRAM and hasattr(_adapter, "pause_typing_for_chat"):
@@ -17575,7 +17603,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         _stream_consumer = GatewayStreamConsumer(
                             adapter=_adapter,
-                            chat_id=source.chat_id,
+                            chat_id=_sc_chat_id,
                             config=_consumer_cfg,
                             metadata=_status_thread_metadata,
                             on_new_message=(
@@ -18113,8 +18141,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Slack threads and reserved by Matrix clients.
                 _p = getattr(_status_adapter, "typed_command_prefix", "/")
                 cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+                # Tool-gate approvals carry kind="tool" + tool_name; render a
+                # tool-flavoured header instead of "Dangerous command" so the
+                # prompt matches what's actually being approved (§6a).
+                if approval_data.get("kind") == "tool":
+                    _tool_name = approval_data.get("tool_name", "this tool")
+                    _header = f"⚠️ **Approval required to run `{_tool_name}`:**"
+                else:
+                    _header = "⚠️ **Dangerous command requires approval:**"
                 msg = (
-                    f"⚠️ **Dangerous command requires approval:**\n"
+                    f"{_header}\n"
                     f"```\n{cmd_preview}\n```\n"
                     f"Reason: {desc}\n\n"
                     f"Reply `{_p}approve` to execute, `{_p}approve session` to approve this pattern "
@@ -18306,6 +18342,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
             register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            self._register_bridge_approval(_bridge_session_key, _approval_session_key)
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -18357,6 +18394,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
                 unregister_gateway_notify(_approval_session_key)
+                self._unregister_bridge_approval(_bridge_session_key)
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.
@@ -18744,11 +18782,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                         )
                                         pending_text = _enriched
                                         if _transcripts and self._should_echo_stt_transcripts():
-                                            _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                                            _echo_adapter, _echo_chat_id = self._bridged(source, _adapter, source.chat_id)
+                                            _echo_meta = (
+                                                None
+                                                if _echo_chat_id != source.chat_id
+                                                else ({"thread_id": source.thread_id} if source.thread_id else None)
+                                            )
                                             for _tx in _transcripts:
                                                 try:
-                                                    await _adapter.send(
-                                                        source.chat_id,
+                                                    await _echo_adapter.send(
+                                                        _echo_chat_id,
                                                         f'🎙️ "{_tx}"',
                                                         metadata=_echo_meta,
                                                     )
@@ -18793,7 +18836,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         async def _notify_long_running():
             if _NOTIFY_INTERVAL is None:
                 return  # Notifications disabled (gateway_notify_interval: 0)
-            _notify_adapter = self.adapters.get(source.platform)
+            _notify_adapter, _notify_chat_id = self._bridged(source, self.adapters.get(source.platform), source.chat_id)
             if not _notify_adapter:
                 return
             # Track the heartbeat message id so we can edit-in-place on
@@ -18858,7 +18901,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _heartbeat_msg_id:
                         try:
                             _notify_res = await _notify_adapter.edit_message(
-                                source.chat_id,
+                                _notify_chat_id,
                                 _heartbeat_msg_id,
                                 _heartbeat_text,
                             )
@@ -18867,7 +18910,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             _notify_res = None
                     if not (_notify_res and getattr(_notify_res, "success", False)):
                         _notify_res = await _notify_adapter.send(
-                            source.chat_id,
+                            _notify_chat_id,
                             _heartbeat_text,
                             metadata=_non_conversational_metadata(_status_thread_metadata, platform=source.platform),
                         )
@@ -18978,13 +19021,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if (not _warning_fired and _agent_warning is not None
                             and _idle_secs >= _agent_warning):
                         _warning_fired = True
-                        _warn_adapter = self.adapters.get(source.platform)
+                        _warn_adapter, _warn_chat_id = self._bridged(source, self.adapters.get(source.platform), source.chat_id)
                         if _warn_adapter:
                             _elapsed_warn = int(_agent_warning // 60) or 1
                             _remaining_mins = int((_agent_timeout - _agent_warning) // 60) or 1
                             try:
                                 await _warn_adapter.send(
-                                    source.chat_id,
+                                    _warn_chat_id,
                                     f"⚠️ No activity for {_elapsed_warn} min. "
                                     f"If the agent does not respond soon, it will "
                                     f"be timed out in {_remaining_mins} min. "
@@ -19166,11 +19209,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             )
                             pending = _enriched or None
                             if _transcripts and self._should_echo_stt_transcripts():
-                                _echo_meta = {"thread_id": source.thread_id} if source.thread_id else None
+                                _echo_adapter, _echo_chat_id = self._bridged(source, adapter, source.chat_id)
+                                _echo_meta = (
+                                    None
+                                    if _echo_chat_id != source.chat_id
+                                    else ({"thread_id": source.thread_id} if source.thread_id else None)
+                                )
                                 for _tx in _transcripts:
                                     try:
-                                        await adapter.send(
-                                            source.chat_id,
+                                        await _echo_adapter.send(
+                                            _echo_chat_id,
                                             f'🎙️ "{_tx}"',
                                             metadata=_echo_meta,
                                         )
@@ -19283,8 +19331,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 "Queued follow-up for session %s: final stream delivery not confirmed; sending first response before continuing.",
                                 session_key or "?",
                             )
-                            await adapter.send(
-                                source.chat_id,
+                            _first_resp_adapter, _first_resp_chat_id = self._bridged(source, adapter, source.chat_id)
+                            await _first_resp_adapter.send(
+                                _first_resp_chat_id,
                                 first_response,
                                 metadata=_status_thread_metadata,
                             )
@@ -19365,11 +19414,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # Restart typing indicator so the user sees activity while
                 # the follow-up turn runs.  The outer _process_message_background
                 # typing task is still alive but may be stale.
-                _followup_adapter = self.adapters.get(source.platform)
+                _followup_adapter, _followup_chat_id = self._bridged(source, self.adapters.get(source.platform), source.chat_id)
                 if _followup_adapter:
                     try:
                         await _followup_adapter.send_typing(
-                            source.chat_id,
+                            _followup_chat_id,
                             metadata=_status_thread_metadata,
                         )
                     except Exception:
@@ -19519,7 +19568,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _sc_msg_id:
                     try:
                         await _sc.adapter.edit_message(
-                            chat_id=source.chat_id,
+                            chat_id=self._bridged(source, _sc.adapter, source.chat_id)[1],
                             message_id=_sc_msg_id,
                             content=response["final_response"],
                             finalize=True,
@@ -19550,7 +19599,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             and hasattr(_cleanup_adapter, "register_post_delivery_callback")
         ):
             _ids_snapshot = list(_cleanup_msg_ids)
-            _chat_id_snapshot = source.chat_id
+            _chat_id_snapshot = _cleanup_chat_id
             _adapter_snapshot = _cleanup_adapter
             _loop_snapshot = asyncio.get_running_loop()
 
