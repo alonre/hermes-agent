@@ -546,10 +546,10 @@ async function startSocket() {
       // Handle fromMe messages based on mode
       let fromOwner = false;
       if (msg.key.fromMe) {
-        if (isGroup || chatId.includes('status')) {
+        if (chatId.includes('status')) {
           emitDebugEvent({
             stage: 'ignored',
-            reason: isGroup ? 'from_me_group' : 'from_me_status',
+            reason: 'from_me_status',
             chatId: redactWhatsAppId(chatId),
           });
           continue;
@@ -590,29 +590,37 @@ async function startSocket() {
           }
           fromOwner = true;
         } else {
-          // Self-chat mode: only allow messages in the user's own self-chat.
-          // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
-          // AND classic format: 34652029134@s.whatsapp.net
-          // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
-          const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
-          const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
-          const chatNumber = chatId.replace(/@.*/, '');
-          const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
-          emitDebugEvent({
-            stage: 'self_chat_check',
-            matched: !!isSelfChat,
-            chatId: redactWhatsAppId(chatId),
-            accountId: redactWhatsAppId(sock.user?.id),
-            accountLid: redactWhatsAppId(sock.user?.lid),
-          });
-          if (!isSelfChat) {
+          // Self-chat mode: allow the user's own GROUP messages through so that
+          // @mention triggers in groups work. Echo detection below (recentlySentIds)
+          // prevents the agent's own group replies from re-entering the queue.
+          // FORK BEHAVIOR: upstream's self-chat path has no `if (!isGroup)` guard
+          // and drops group messages — do not collapse this back to a bare
+          // self-chat DM check, or in-group @mention triggers stop working.
+          if (!isGroup) {
+            // For DMs, only process messages in the user's own self-chat.
+            // WhatsApp now uses LID (Linked Identity Device) format: 67427329167522@lid
+            // AND classic format: 34652029134@s.whatsapp.net
+            // sock.user has both: { id: "number:10@s.whatsapp.net", lid: "lid_number:10@lid" }
+            const myNumber = (sock.user?.id || '').replace(/:.*@/, '@').replace(/@.*/, '');
+            const myLid = (sock.user?.lid || '').replace(/:.*@/, '@').replace(/@.*/, '');
+            const chatNumber = chatId.replace(/@.*/, '');
+            const isSelfChat = (myNumber && chatNumber === myNumber) || (myLid && chatNumber === myLid);
             emitDebugEvent({
-              stage: 'ignored',
-              reason: 'self_chat_mismatch',
+              stage: 'self_chat_check',
+              matched: !!isSelfChat,
               chatId: redactWhatsAppId(chatId),
-              senderId: redactWhatsAppId(senderId),
+              accountId: redactWhatsAppId(sock.user?.id),
+              accountLid: redactWhatsAppId(sock.user?.lid),
             });
-            continue;
+            if (!isSelfChat) {
+              emitDebugEvent({
+                stage: 'ignored',
+                reason: 'self_chat_mismatch',
+                chatId: redactWhatsAppId(chatId),
+                senderId: redactWhatsAppId(senderId),
+              });
+              continue;
+            }
           }
         }
       }
@@ -875,6 +883,30 @@ app.post('/edit', async (req, res) => {
     }
 
     res.json({ success: true, messageIds });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+// React to a message (used for WhatsApp self-send bridging acks)
+app.post('/reaction', async (req, res) => {
+  if (!sock || connectionState !== 'connected') {
+    return res.status(503).json({ error: 'Not connected to WhatsApp' });
+  }
+
+  const { chatId, messageId, reaction } = req.body;
+  if (!chatId || !messageId) {
+    return res.status(400).json({ error: 'chatId and messageId are required' });
+  }
+
+  try {
+    await sock.sendMessage(chatId, {
+      react: {
+        text: reaction || '',
+        key: { id: messageId, fromMe: true, remoteJid: chatId },
+      },
+    });
+    res.json({ success: true });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
