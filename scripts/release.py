@@ -45,6 +45,11 @@ ACP_REGISTRY_MANIFEST = REPO_ROOT / "acp_registry" / "agent.json"
 
 # Auto-extracted from noreply emails + manual overrides
 AUTHOR_MAP = {
+    "wilsonkinyuam@gmail.com": "WilsonKinyua",  # PR #62052 (tui: persist unflushed conversations on disconnect/restart)
+    "humphreysun98@gmail.com": "HumphreySun98",  # PR #61142 salvage (web: null web/backend config value guards)
+    "sonxi@nous.local": "17324393074",  # PR #53196 salvage (tools_config: known_plugin_toolsets null guard; commit under unlinked local identity)
+    "lemonwan@users.noreply.github.com": "lemonwan",  # PR #59430 sibling salvage (adapter reconnect contract guard)
+    "luxuguangno1@163.com": "luxuguang-leo",  # PR #52966 + #52908 salvage (QQBot reconnect + Feishu Channel signaling)
     "grace@weeb.onl": "evelynburger",  # PR #57544 salvage (gateway: webhook payload filters + route scripts; commit under unlinked identity)
     "contato@siteup.com.br": "SiteupAgencia",  # PR #57435 salvage (tui_gateway: back off notification poller when session is busy; #55578)
     "164521089+rainbowgits@users.noreply.github.com": "rainbowgore",  # PR #59405 salvage (mcp: bound stdio initialize handshake to stop subprocess/FD leak; #59349)
@@ -54,6 +59,7 @@ AUTHOR_MAP = {
     "taylorhp@gmail.com": "hwrdprkns",  # PR #36896 salvage (secrets: 1Password op:// secret source + shared _cache substrate, adapted onto the SecretSource interface)
     "ishengeqi@163.com": "isheng-eqi",  # PR #59428 salvage (cron: reject past one-shot timestamps in update_job fallback + resume_job; #59395). Also PR #59446 salvage (cron: advance one-shot next_run_at before dispatch so concurrent gateway+desktop schedulers can't double-execute; #59229).
     "derek2000139@qq.com": "derek2000139",  # PR #57838 salvage (desktop/windows: pre-write update marker before quit dwell so the renderer's waitForUpdateToFinish gate parks instead of respawning a backend that re-locks venv .pyd files mid-update)
+    "gigakun@agentmail.to": "gigakun3030",  # PR #61163 (models: remove unavailable OpenCode Zen free models)
     "AndreasHiltner@users.noreply.github.com": "AndreasHiltner",  # PR #56854 salvage (gateway: route multiplex profile responses through the profile's own adapter — 53-site _adapter_for_source sweep)
     "AlexFucuson9@users.noreply.github.com": "AlexFucuson9",  # PR #61347 salvage (agent: reapply provider headers after model switch; #61099)
     "allenliang2022@users.noreply.github.com": "allenliang2022",  # PR #56932 test coverage folded into #56909 salvage (408 → retryable timeout)
@@ -260,6 +266,7 @@ AUTHOR_MAP = {
     "bassisho@Mac-mini-bassis.local": "hydracoco7",  # PR #61382 salvage (id-less cron job freeze)
     "AlexFucuson9@users.noreply.github.com": "AlexFucuson9",  # PR #61209 salvage (hygiene compression data loss)
     "email@adambig.gs": "adambiggs",  # PR #43819 salvage (holographic shared SQLite connection)
+    "koho.jung@outlook.com": "kohoj",  # PR #61667 salvage (nonce-CSP HTML session export)
     "t.chen@aftership.com": "cypctlinux",  # PR #52403 salvage (Slack bot/workflow auth before no-user-id guard)
     "30854794+YLChen-007@users.noreply.github.com": "YLChen-007",  # PR #26965 (approval remote command substitution)
     "1078345+egilewski@users.noreply.github.com": "egilewski",  # co-author, PR #40663
