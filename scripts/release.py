@@ -89,6 +89,7 @@ AUTHOR_MAP = {
     "39274208+falkoro@users.noreply.github.com": "falkoro",  # PRs #58519/#58520 salvage (config: env-ref-aware load_config cache invalidation; auxiliary: honor auxiliary.<task>.base_url/api_key with explicit provider arg)
     "jakub.wolniewicz@gmail.com": "frizikk",  # PR #59778 (desktop: dismiss stale prompt overlays)
     "markvlcek@gmail.com": "MarkVLK",  # PR #63080 salvage (desktop: structured Fallback Models editor, from #47522)
+    "agent@agents-Mac-mini.local": "momomojo",  # PR #43692 (kanban: spawn goal_mode workers with -Q so the goal loop actually runs; commit under unlinked local identity)
     "3723267+kevinrajaram@users.noreply.github.com": "kevinrajaram",  # PR #3850 salvage (gateway: add POSIX system dirs to PATH so launchctl/systemctl resolve under UV's minimal-PATH bundled Python; #3849)
     "lord-dubious@users.noreply.github.com": "lord-dubious",  # PR #58453 salvage (preserve static custom provider models declared as dict rows)
     "williamumu@users.noreply.github.com": "williamumu",  # PR #31041 salvage (pairing: merge split legacy/new pairing store dirs at PairingStore init so approved users aren't re-prompted to pair)
