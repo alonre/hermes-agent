@@ -79,6 +79,30 @@ logger = logging.getLogger(__name__)
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
 
+def _append_thinking_prefill(messages: list, interim_msg: dict) -> None:
+    """Append a thinking-only prefill message, merging into an existing one.
+
+    A second prefill retry must not stack another assistant message on the
+    tail: llama.cpp (gemma chat templates) hard-rejects requests whose
+    message list ends with 2+ assistant messages ("Cannot have 2 or more
+    assistant messages at the end of the list"), turning every second
+    prefill retry into an HTTP 400.
+    """
+    if (
+        messages
+        and isinstance(messages[-1], dict)
+        and messages[-1].get("_thinking_prefill")
+    ):
+        prev = messages[-1]
+        for key in ("content", "reasoning", "reasoning_content"):
+            new_val = interim_msg.get(key)
+            if new_val:
+                old_val = prev.get(key)
+                prev[key] = f"{old_val}\n{new_val}" if old_val else new_val
+    else:
+        messages.append(interim_msg)
+
+
 def _image_error_max_dimension(error: Exception) -> Optional[int]:
     """Extract a provider-reported image dimension ceiling, if present."""
     parts = []
@@ -5038,7 +5062,7 @@ def run_conversation(
                             assistant_message, "incomplete"
                         )
                         interim_msg["_thinking_prefill"] = True
-                        messages.append(interim_msg)
+                        _append_thinking_prefill(messages, interim_msg)
                         agent._session_messages = messages
                         continue
 
