@@ -80,6 +80,10 @@ _HERMES_CORE_TOOLS = [
     "kanban_complete", "kanban_block", "kanban_heartbeat",
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
+    # PaperClip work-protocol tools — only in schema when the agent's
+    # environment carries PAPERCLIP_AGENT_API_KEY (every PaperClip-onboarded
+    # profile). Gated via check_fn in tools/paperclip_tools.py.
+    "paperclip_set_disposition", "paperclip_create_issue",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
@@ -278,6 +282,19 @@ TOOLSETS = {
             "kanban_create", "kanban_link",
             "kanban_unblock",
         ],
+        "includes": [],
+    },
+
+    "paperclip": {
+        "description": (
+            "PaperClip work-protocol tools — only active when the agent's "
+            "environment carries PAPERCLIP_AGENT_API_KEY (every "
+            "PaperClip-onboarded profile, wired in by the console's "
+            "provisioning step). Lets a woken agent record its mandatory "
+            "final disposition and create tracked delegate/consult issues "
+            "without needing a terminal tool."
+        ),
+        "tools": ["paperclip_set_disposition", "paperclip_create_issue"],
         "includes": [],
     },
 
