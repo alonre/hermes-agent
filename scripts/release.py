@@ -118,6 +118,7 @@ LEGACY_AUTHOR_MAP = {
     "taylorhp@gmail.com": "hwrdprkns",  # PR #36896 salvage (secrets: 1Password op:// secret source + shared _cache substrate, adapted onto the SecretSource interface)
     "ishengeqi@163.com": "isheng-eqi",  # PR #59428 salvage (cron: reject past one-shot timestamps in update_job fallback + resume_job; #59395). Also PR #59446 salvage (cron: advance one-shot next_run_at before dispatch so concurrent gateway+desktop schedulers can't double-execute; #59229).
     "derek2000139@qq.com": "derek2000139",  # PR #57838 salvage (desktop/windows: pre-write update marker before quit dwell so the renderer's waitForUpdateToFinish gate parks instead of respawning a backend that re-locks venv .pyd files mid-update)
+    "gigakun@agentmail.to": "gigakun3030",  # PR #61163 (models: remove unavailable OpenCode Zen free models)
     "AndreasHiltner@users.noreply.github.com": "AndreasHiltner",  # PR #56854 salvage (gateway: route multiplex profile responses through the profile's own adapter — 53-site _adapter_for_source sweep)
     "AlexFucuson9@users.noreply.github.com": "AlexFucuson9",  # PR #61347 salvage (agent: reapply provider headers after model switch; #61099)
     "allenliang2022@users.noreply.github.com": "allenliang2022",  # PR #56932 test coverage folded into #56909 salvage (408 → retryable timeout)
@@ -135,6 +136,9 @@ LEGACY_AUTHOR_MAP = {
     "perkintahmaz50@gmail.com": "devatnull",  # PR #58704 salvage (whatsapp: native Baileys polls, clarify-as-poll, location pins, structured quoted replies, PTT/audio split, bridge_helpers extraction)
     "tim@iteachyouai.com": "tjp2021",  # PR #4097 salvage (copilot: per-turn x-initiator header so user prompts bill as premium requests; #3040)
     "39274208+falkoro@users.noreply.github.com": "falkoro",  # PRs #58519/#58520 salvage (config: env-ref-aware load_config cache invalidation; auxiliary: honor auxiliary.<task>.base_url/api_key with explicit provider arg)
+    "jakub.wolniewicz@gmail.com": "frizikk",  # PR #59778 (desktop: dismiss stale prompt overlays)
+    "markvlcek@gmail.com": "MarkVLK",  # PR #63080 salvage (desktop: structured Fallback Models editor, from #47522)
+    "agent@agents-Mac-mini.local": "momomojo",  # PR #43692 (kanban: spawn goal_mode workers with -Q so the goal loop actually runs; commit under unlinked local identity)
     "3723267+kevinrajaram@users.noreply.github.com": "kevinrajaram",  # PR #3850 salvage (gateway: add POSIX system dirs to PATH so launchctl/systemctl resolve under UV's minimal-PATH bundled Python; #3849)
     "lord-dubious@users.noreply.github.com": "lord-dubious",  # PR #58453 salvage (preserve static custom provider models declared as dict rows)
     "williamumu@users.noreply.github.com": "williamumu",  # PR #31041 salvage (pairing: merge split legacy/new pairing store dirs at PairingStore init so approved users aren't re-prompted to pair)
@@ -2031,7 +2035,7 @@ LEGACY_AUTHOR_MAP = {
     "SJWATTS89@OUTLOOK.COM": "lEWFkRAD",  # PR #45610 (Windows scheduled task reboot survival)
     "andhika.prakasiwi@gmail.com": "p-andhika",  # PR #53312 co-author (setup guide button)
     "annguyen@nousresearch.com": "annguyenNous",  # PR #52844 co-author
-    "carlitosdiazplaza@gmail.com": "talmax1124",  # direct email match
+    "carlitosdiazplaza@gmail.com": "talmax1124",  # PR #55931 (TUI drag-resize reflow + resize-burst heal coverage; #18449)
     "christianpersico98@gmail.com": "chrispersico",  # commit 135f2351 PR author
     "daniel.laforce@argobox.com": "KeyArgo",  # co-author
     "joeykerp@gmail.com": "spjoes",  # direct email match
@@ -2052,6 +2056,7 @@ LEGACY_AUTHOR_MAP = {
     "1torhan@protonmail.com": "uzaylisak",  # PR #29988 salvage (detect_local_server_type process-lifetime cache)
     "zhchl@hermes-agent.local": "8294",  # PR #50572 salvage (honor config context_length on banner)
     "yansh2017@gmail.com": "ya-nsh",  # PR #26790 salvage (normalize local terminal relative cwd; #26783)
+    "git@hode.co.uk": "okisdev",  # upstream author (Harry Yep; desktop math-delimiter/streaming commits)
 }
 
 

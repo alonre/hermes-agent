@@ -41,8 +41,13 @@ _HERMES_CORE_TOOLS = [
     "read_file", "write_file", "patch", "search_files",
     # Vision + image generation
     "vision_analyze", "image_generate",
-    # Skills
-    "skills_list", "skill_view", "skill_manage",
+    # Skills. skill_discover/skill_acquire are the fork's discovery + trust-gated
+    # hub-install tools (#718d3bd42); they belong to the `skills` toolset, so they
+    # must be in core too — otherwise the `skills` toolset is a superset of the
+    # hermes-cli composite and never reverse-maps as enabled (it silently shows
+    # disabled, and the two tools are unreachable in a default CLI session).
+    # Both self-gate at runtime (check_fn / trust-staging), so default exposure is safe.
+    "skills_list", "skill_view", "skill_manage", "skill_discover", "skill_acquire",
     # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
@@ -76,6 +81,10 @@ _HERMES_CORE_TOOLS = [
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    # PaperClip work-protocol tools — only in schema when the agent's
+    # environment carries PAPERCLIP_AGENT_API_KEY (every PaperClip-onboarded
+    # profile). Gated via check_fn in tools/paperclip_tools.py.
+    "paperclip_set_disposition", "paperclip_create_issue",
     # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
 ]
@@ -166,10 +175,10 @@ TOOLSETS = {
     
     "skills": {
         "description": "Access, create, edit, and manage skill documents with specialized instructions and knowledge",
-        "tools": ["skills_list", "skill_view", "skill_manage"],
+        "tools": ["skills_list", "skill_view", "skill_manage", "skill_discover", "skill_acquire"],
         "includes": []
     },
-    
+
     "browser": {
         "description": "Browser automation for web interaction (navigate, click, type, scroll, iframes, hold-click) with web search for finding URLs",
         "tools": [
@@ -275,6 +284,19 @@ TOOLSETS = {
             "kanban_unblock",
             "kanban_attach", "kanban_attach_url", "kanban_attachments",
         ],
+        "includes": [],
+    },
+
+    "paperclip": {
+        "description": (
+            "PaperClip work-protocol tools — only active when the agent's "
+            "environment carries PAPERCLIP_AGENT_API_KEY (every "
+            "PaperClip-onboarded profile, wired in by the console's "
+            "provisioning step). Lets a woken agent record its mandatory "
+            "final disposition and create tracked delegate/consult issues "
+            "without needing a terminal tool."
+        ),
+        "tools": ["paperclip_set_disposition", "paperclip_create_issue"],
         "includes": [],
     },
 

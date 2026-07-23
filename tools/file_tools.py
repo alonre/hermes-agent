@@ -623,6 +623,68 @@ def _check_sensitive_path(filepath: str, task_id: str = "default") -> str | None
     return None
 
 
+_allowed_write_roots_cached: list | None = None
+_allowed_write_roots_loaded = False
+
+
+def _get_allowed_write_roots() -> list | None:
+    """Return the configured write-root allowlist, resolved; None = unrestricted.
+
+    ``file_tools.allowed_write_roots`` in config.yaml (per-profile) lists the
+    only directories ``write_file``/``patch`` may target. Absent or empty ⇒
+    no restriction (backwards compatible). Reads are deliberately NOT scoped:
+    the threat model is a confabulating run corrupting host files, and read
+    flows (configs, attachments, repos) are legitimate fleet-wide.
+    """
+    global _allowed_write_roots_cached, _allowed_write_roots_loaded
+    if _allowed_write_roots_loaded:
+        return _allowed_write_roots_cached
+    _allowed_write_roots_loaded = True
+    try:
+        from hermes_cli.config import load_config
+        roots = (load_config().get("file_tools") or {}).get("allowed_write_roots") or []
+        resolved = []
+        for r in roots:
+            if isinstance(r, str) and r.strip():
+                try:
+                    resolved.append(str(Path(_expand_tilde(r.strip())).resolve()))
+                except OSError:
+                    continue
+        _allowed_write_roots_cached = resolved or None
+    except Exception:
+        _allowed_write_roots_cached = None
+    return _allowed_write_roots_cached
+
+
+def _check_allowed_write_roots(filepath: str, task_id: str = "default") -> str | None:
+    """Hard guard: error text when a write targets a path outside the allowlist.
+
+    Unlike ``_check_cross_profile_path`` this is NOT overridable from the tool
+    call — the allowlist exists precisely to bound what a misbehaving agent
+    run can damage, so only a human editing config.yaml can widen it.
+    """
+    roots = _get_allowed_write_roots()
+    if not roots:
+        return None
+    try:
+        resolved = Path(_resolve_path_for_task(filepath, task_id)).resolve()
+    except (OSError, ValueError):
+        resolved = Path(os.path.normpath(_expand_tilde(filepath)))
+    for root in roots:
+        try:
+            if resolved.is_relative_to(root):
+                return None
+        except (OSError, ValueError):
+            continue
+    return (
+        f"Refusing to write outside the allowed write roots: {filepath}\n"
+        f"This profile's file_tools.allowed_write_roots restricts write_file/patch to: "
+        f"{', '.join(roots)}.\n"
+        "If this write is genuinely part of your job, report it as blocked so a "
+        "human can extend the allowlist in config.yaml — do not work around it."
+    )
+
+
 def _get_container_mirror_prefix_for_task(task_id: str = "default") -> str | None:
     """Return the container-side Hermes mirror prefix for Docker file tools."""
     try:
@@ -1583,6 +1645,9 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
     sensitive_err = _check_sensitive_path(path, task_id)
     if sensitive_err:
         return tool_error(sensitive_err)
+    roots_err = _check_allowed_write_roots(path, task_id)
+    if roots_err:
+        return tool_error(roots_err)
     if not cross_profile:
         cross_warning = _check_cross_profile_path(path, task_id)
         if cross_warning:
@@ -1711,6 +1776,9 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         sensitive_err = _check_sensitive_path(_p, task_id)
         if sensitive_err:
             return tool_error(sensitive_err)
+        roots_err = _check_allowed_write_roots(_p, task_id)
+        if roots_err:
+            return tool_error(roots_err)
         if not cross_profile:
             cross_warning = _check_cross_profile_path(_p, task_id)
             if cross_warning:

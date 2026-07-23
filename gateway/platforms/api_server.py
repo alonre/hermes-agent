@@ -19,6 +19,21 @@ Exposes an HTTP server with endpoints:
 - GET  /v1/runs/{run_id}/events    — SSE stream of structured lifecycle events
 - POST /v1/runs/{run_id}/approval — resolve a pending run approval
 - POST /v1/runs/{run_id}/stop       — interrupt a running agent
+- GET  /v1/actions                  — list staged tool-approval actions
+- GET  /v1/actions/{pending_id}     — staged-action detail
+- POST /v1/actions/{pending_id}/approve — approve a staged action (spawn exec card)
+- POST /v1/actions/{pending_id}/reject  — discard a staged action + archive its card
+- GET  /api/config                  — read a profile's config.yaml (?profile= to target a sibling)
+- PUT  /api/config                  — replace a profile's config.yaml (?profile= to target a sibling)
+- GET  /api/profiles                — list profiles on this host
+- POST /api/profiles                — create a new profile (optional api_server_port seeds its .env)
+- POST /api/gateway/restart         — restart this gateway so a config write takes effect
+- POST /api/gateway/start           — start/restart a named sibling profile's gateway (body: {profile})
+- POST /api/gateway/stop            — stop a named sibling profile's gateway (body: {profile})
+- POST /api/profiles/{name}/archive — move a profile dir to profiles/.archived/ (reversible teardown)
+- POST /api/snapshot                — commit a fleet-state snapshot of the agents' brains (P8 M0 versioned write path)
+- GET  /api/soul                    — read a profile's SOUL.md (?profile= to target a sibling)
+- PUT  /api/soul                    — replace a profile's SOUL.md (backs up first; ?profile= to target a sibling)
 - GET  /health                     — health check
 - GET  /health/detailed            — rich status for cross-container dashboard probing
 
@@ -878,6 +893,7 @@ try:
         pause_job as _cron_pause,
         resume_job as _cron_resume,
         trigger_job as _cron_trigger,
+        list_job_runs as _cron_list_runs,
     )
     _CRON_AVAILABLE = True
 except ImportError:
@@ -889,6 +905,7 @@ except ImportError:
     _cron_pause = None
     _cron_resume = None
     _cron_trigger = None
+    _cron_list_runs = None
 
 
 def _notify_cron_provider_jobs_changed() -> None:
@@ -1506,6 +1523,7 @@ class APIServerAdapter(BasePlatformAdapter):
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
+            ("GET", "/api/jobs/{job_id}/runs", self._handle_job_runs),
             ("PATCH", "/api/jobs/{job_id}", self._handle_update_job),
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
@@ -2041,6 +2059,9 @@ class APIServerAdapter(BasePlatformAdapter):
                 "jobs_admin": False,
                 "memory_write_api": False,
                 "skills_api": True,
+                "kanban_api": True,
+                "kanban_read": True,
+                "kanban_write": True,
                 "audio_api": False,
                 "realtime_voice": False,
                 "session_continuity_header": "X-Hermes-Session-Id",
@@ -2058,6 +2079,10 @@ class APIServerAdapter(BasePlatformAdapter):
                 "run_events": {"method": "GET", "path": "/v1/runs/{run_id}/events"},
                 "run_approval": {"method": "POST", "path": "/v1/runs/{run_id}/approval"},
                 "run_stop": {"method": "POST", "path": "/v1/runs/{run_id}/stop"},
+                "actions": {"method": "GET", "path": "/v1/actions"},
+                "action_detail": {"method": "GET", "path": "/v1/actions/{pending_id}"},
+                "action_approve": {"method": "POST", "path": "/v1/actions/{pending_id}/approve"},
+                "action_reject": {"method": "POST", "path": "/v1/actions/{pending_id}/reject"},
                 "skills": {"method": "GET", "path": "/v1/skills"},
                 "toolsets": {"method": "GET", "path": "/v1/toolsets"},
                 "sessions": {"method": "GET", "path": "/api/sessions"},
@@ -2069,6 +2094,14 @@ class APIServerAdapter(BasePlatformAdapter):
                 "session_fork": {"method": "POST", "path": "/api/sessions/{session_id}/fork"},
                 "session_chat": {"method": "POST", "path": "/api/sessions/{session_id}/chat"},
                 "session_chat_stream": {"method": "POST", "path": "/api/sessions/{session_id}/chat/stream"},
+                "kanban_tasks": {"method": "GET", "path": "/api/kanban/tasks"},
+                "kanban_task_create": {"method": "POST", "path": "/api/kanban/tasks"},
+                "kanban_task": {"method": "GET", "path": "/api/kanban/tasks/{task_id}"},
+                "kanban_task_patch": {"method": "PATCH", "path": "/api/kanban/tasks/{task_id}"},
+                "kanban_task_assign": {"method": "POST", "path": "/api/kanban/tasks/{task_id}/assign"},
+                "kanban_task_comment": {"method": "POST", "path": "/api/kanban/tasks/{task_id}/comment"},
+                "kanban_assignees": {"method": "GET", "path": "/api/kanban/assignees"},
+                "kanban_dispatch_state": {"method": "GET", "path": "/api/kanban/dispatch/state"},
             },
         })
 
@@ -2098,10 +2131,19 @@ class APIServerAdapter(BasePlatformAdapter):
                 status=500,
             )
 
-        return web.json_response({
-            "object": "list",
-            "data": skills,
-        })
+        body = {"object": "list", "data": skills}
+        # ?include=files&names=a,b,c: attach live file contents for the named
+        # skills (the caller's version-controlled set) so a remote drift diff
+        # matches a local one. Scoped to names to keep the payload small.
+        if request.query.get("include", "").lower() == "files":
+            names = [n.strip() for n in request.query.get("names", "").split(",") if n.strip()]
+            try:
+                from tools.skills_tool import read_skill_files
+                body["files"] = read_skill_files(names)
+            except Exception:
+                logger.exception("GET /v1/skills?include=files failed")
+                body["files"] = {}
+        return web.json_response(body)
 
     async def _handle_toolsets(self, request: "web.Request") -> "web.Response":
         """GET /v1/toolsets — list toolsets and their resolved tools.
@@ -4108,10 +4150,14 @@ class APIServerAdapter(BasePlatformAdapter):
     # ------------------------------------------------------------------
 
     _JOB_ID_RE = __import__("re").compile(r"[a-f0-9]{12}")
-    # Allowed fields for update — prevents clients injecting arbitrary keys
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    # Allowed fields for update — prevents clients injecting arbitrary keys.
+    # `responsibility_id` links a routine to the responsibility it serves (the
+    # console's coverage view); it's plain linkage metadata, not behavior.
+    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill",
+                              "repeat", "enabled", "responsibility_id"}
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
+    _MAX_RESPONSIBILITY_ID_LENGTH = 128
 
     @staticmethod
     def _check_jobs_available() -> Optional["web.Response"]:
@@ -4147,6 +4193,23 @@ class APIServerAdapter(BasePlatformAdapter):
         try:
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
             jobs = _cron_list(include_disabled=include_disabled)
+            # ?include=runs[&days=N]: fold each job's per-run outcomes (windowed)
+            # + its newest run so dashboards can compute health without reading
+            # the cron output directory off disk. Summaries only (no bodies);
+            # full output files come from /api/jobs/{id}/runs.
+            if request.query.get("include", "").lower() == "runs" and _cron_list_runs:
+                try:
+                    days = int(request.query.get("days", "7"))
+                except ValueError:
+                    days = 7
+                days = max(1, min(days, 90))
+                for job in jobs:
+                    jid = job.get("id") or ""
+                    runs = _cron_list_runs(jid, days=days)
+                    job["recent_runs"] = runs
+                    job["last_run"] = (
+                        runs[0] if runs else next(iter(_cron_list_runs(jid, limit=1)), None)
+                    )
             return web.json_response({"jobs": jobs})
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
@@ -4224,6 +4287,42 @@ class APIServerAdapter(BasePlatformAdapter):
         except Exception as e:
             return web.json_response({"error": _redact_api_error_text(e)}, status=500)
 
+    async def _handle_job_runs(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/{job_id}/runs — per-run history WITH the output bodies.
+
+        Returns the actual run-output files (newest first) so a dashboard can
+        show the full log of any run, not just the latest status. Query:
+        ``limit`` (default 20, ≤100), ``days`` (trailing window). Each record:
+        ``{ts, status, error, content}``.
+        """
+        auth_err = self._check_auth(request)
+        if auth_err:
+            return auth_err
+        cron_err = self._check_jobs_available()
+        if cron_err:
+            return cron_err
+        job_id, id_err = self._check_job_id(request)
+        if id_err:
+            return id_err
+        if not _cron_list_runs:
+            return web.json_response({"error": "Cron run history unavailable"}, status=503)
+        try:
+            limit = int(request.query.get("limit", "20"))
+        except ValueError:
+            limit = 20
+        limit = max(1, min(limit, 100))
+        days = None
+        if "days" in request.query:
+            try:
+                days = max(1, min(int(request.query["days"]), 90))
+            except ValueError:
+                days = None
+        try:
+            runs = _cron_list_runs(job_id, days=days, limit=limit, include_content=True)
+            return web.json_response({"job_id": job_id, "runs": runs})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
     async def _handle_update_job(self, request: "web.Request") -> "web.Response":
         """PATCH /api/jobs/{job_id} — update a cron job."""
         auth_err = self._check_auth(request)
@@ -4250,6 +4349,17 @@ class APIServerAdapter(BasePlatformAdapter):
                 return web.json_response(
                     {"error": f"Prompt must be ≤ {self._MAX_PROMPT_LENGTH} characters"}, status=400,
                 )
+            # responsibility_id: a slug/sentinel string, or null to clear (untriaged).
+            if "responsibility_id" in sanitized:
+                rid = sanitized["responsibility_id"]
+                if rid is not None and (
+                    not isinstance(rid, str) or len(rid) > self._MAX_RESPONSIBILITY_ID_LENGTH
+                ):
+                    return web.json_response(
+                        {"error": f"responsibility_id must be a string ≤ "
+                                  f"{self._MAX_RESPONSIBILITY_ID_LENGTH} characters, or null"},
+                        status=400,
+                    )
             if sanitized.get("prompt") and _scan_cron_prompt is not None:
                 scan_error = _scan_cron_prompt(sanitized["prompt"])
                 if scan_error:
@@ -5408,6 +5518,11 @@ class APIServerAdapter(BasePlatformAdapter):
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+            # Console API routes (kanban, actions, config/profiles, soul) are
+            # registered via a fork-private seam module so future upstream edits
+            # to connect() never conflict with this block.
+            from gateway.platforms import _console_routes
+            _console_routes.register(self)
             # Store the adapter after native routes are registered. Local Hermes-Relay
             # bootstrap shims use this key as a feature-detection hook; registering
             # native routes first lets those shims no-op instead of shadowing the

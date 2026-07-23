@@ -4651,10 +4651,12 @@ class GatewaySlashCommandsMixin:
         )
 
         if not has_blocking_approval(session_key):
-            if session_key in self._pending_approvals:
-                self._pending_approvals.pop(session_key)
-                return t("gateway.approval_expired")
-            return t("gateway.approve.no_pending")
+            session_key = self._resolve_approval_session_key(session_key)
+            if not has_blocking_approval(session_key):
+                if session_key in self._pending_approvals:
+                    self._pending_approvals.pop(session_key)
+                    return t("gateway.approval_expired")
+                return t("gateway.approve.no_pending")
 
         # Parse args: support "all", "all session", "all always", "session", "always"
         args = event.get_command_args().strip().lower().split()
@@ -4700,10 +4702,12 @@ class GatewaySlashCommandsMixin:
         )
 
         if not has_blocking_approval(session_key):
-            if session_key in self._pending_approvals:
-                self._pending_approvals.pop(session_key)
-                return t("gateway.deny.stale")
-            return t("gateway.deny.no_pending")
+            session_key = self._resolve_approval_session_key(session_key)
+            if not has_blocking_approval(session_key):
+                if session_key in self._pending_approvals:
+                    self._pending_approvals.pop(session_key)
+                    return t("gateway.deny.stale")
+                return t("gateway.deny.no_pending")
 
         # Parse args: a leading "all" token denies every pending command;
         # anything after it (or the whole arg string when "all" is absent) is
