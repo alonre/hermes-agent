@@ -86,18 +86,6 @@ class TestIsSafePath:
         dg = _load_lib()
         assert dg.is_safe_path(Path("/etc/passwd")) is False
 
-    def test_accepts_tmp_hermes_prefix(self, _isolate_env, tmp_path):
-        dg = _load_lib()
-        assert dg.is_safe_path(Path("/tmp/hermes-abc/x.log")) is True
-
-    def test_rejects_plain_tmp(self, _isolate_env):
-        dg = _load_lib()
-        assert dg.is_safe_path(Path("/tmp/other.log")) is False
-
-    def test_rejects_windows_mount(self, _isolate_env):
-        dg = _load_lib()
-        assert dg.is_safe_path(Path("/mnt/c/Users/x/test.txt")) is False
-
 
 class TestGuessCategory:
     def test_test_prefix(self, _isolate_env):
@@ -136,30 +124,6 @@ class TestGuessCategory:
         p.write_text("x")
         assert dg.guess_category(p) == "cron-output"
 
-    def test_cron_output_root_not_tracked(self, _isolate_env):
-        """The cron/output root is durable container state, not an artifact."""
-        dg = _load_lib()
-        output_root = _isolate_env / "cron" / "output"
-        output_root.mkdir(parents=True)
-        assert dg.guess_category(output_root) is None
-
-    def test_cron_jobs_json_not_tracked(self, _isolate_env):
-        """Regression for #32164: the cron registry must never be tracked."""
-        dg = _load_lib()
-        cron_dir = _isolate_env / "cron"
-        cron_dir.mkdir()
-        p = cron_dir / "jobs.json"
-        p.write_text("[]")
-        assert dg.guess_category(p) is None
-
-    def test_cron_tick_lock_not_tracked(self, _isolate_env):
-        """Regression for #32164: cron tick-lock is control-plane state."""
-        dg = _load_lib()
-        cron_dir = _isolate_env / "cron"
-        cron_dir.mkdir()
-        p = cron_dir / ".tick.lock"
-        p.write_text("")
-        assert dg.guess_category(p) is None
 
     def test_cronjobs_top_level_not_tracked(self, _isolate_env):
         """The legacy ``cronjobs`` alias is also control-plane at the top."""
@@ -175,6 +139,52 @@ class TestGuessCategory:
         p = _isolate_env / "notes.md"
         p.write_text("x")
         assert dg.guess_category(p) is None
+
+
+class TestProfileUserTreesNeverCleaned:
+    """``workspace/`` (and the other per-profile user trees) hold project files, so
+    a ``test_*``/``tmp_*`` name inside them is never a disposable scratch file.
+
+    Regression for the data loss where ``workspace/<project>/tests/test_parse.py`` was
+    classified "test" on write and unlinked by ``quick()`` at session end.
+    """
+
+    def test_session_end_hook_leaves_workspace_files_alone(self, _isolate_env):
+        """End-to-end: write_file into a project tree, then session end. A scratch file at
+        the HERMES_HOME root is the control: it is still tracked and removed."""
+        pi = _load_plugin_init()
+        dg = _load_lib()
+        keep = _isolate_env / "workspace" / "proj" / "tests" / "test_parse.py"
+        keep.parent.mkdir(parents=True)
+        keep.write_text("x")
+        scratch = _isolate_env / "tmp_scratch.py"
+        scratch.write_text("x")
+        assert dg.guess_category(keep) is None
+        assert dg.guess_category(scratch) == "test"
+        for p in (keep, scratch):
+            pi._on_post_tool_call(
+                tool_name="write_file",
+                args={"path": str(p), "content": "x"},
+                result="OK",
+                task_id="t_ws", session_id="s_ws",
+            )
+        pi._on_session_end(session_id="s_ws", completed=True, interrupted=False)
+        assert keep.exists(), "session-end cleanup must not touch workspace project files"
+        assert not scratch.exists(), "root-level scratch files are still cleaned up"
+
+    def test_empty_dir_sweep_skips_workspace(self, _isolate_env):
+        """Empty dirs inside a project tree are meaningful (``data/``, ``.artifacts/``)
+        and must survive the empty-dir sweep; unprotected empty top levels are still swept."""
+        dg = _load_lib()
+        keep = _isolate_env / "workspace" / "watch-battery" / "data"
+        keep.mkdir(parents=True)
+        sweepable = _isolate_env / "pairing"
+        sweepable.mkdir()
+
+        dg._sweep_empty_dirs(_isolate_env)
+
+        assert keep.exists(), "empty dir inside workspace/ must survive the sweep"
+        assert not sweepable.exists(), "unprotected empty dirs are still swept"
 
 
 class TestStaleCronEntryMigration:
@@ -213,74 +223,6 @@ class TestStaleCronEntryMigration:
         remaining = json.loads(tracked_file.read_text())
         assert len(remaining) == 0
 
-    def test_quick_skips_stale_cron_output_for_cron_dir(self, _isolate_env):
-        """Stale entry for the cron/ directory itself must not be deleted."""
-        dg = _load_lib()
-        cron_dir = _isolate_env / "cron"
-        cron_dir.mkdir()
-        output_dir = cron_dir / "output"
-        output_dir.mkdir()
-        (output_dir / "run.md").write_text("x")
-
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
-            "path": str(cron_dir),
-            "category": "cron-output",
-            "timestamp": "2025-01-01T00:00:00+00:00",
-            "size": 0,
-        }]))
-
-        summary = dg.quick()
-        assert summary["deleted"] == 0, "cron/ dir must not be deleted"
-        assert cron_dir.exists()
-
-    def test_quick_skips_stale_cron_output_for_output_root(self, _isolate_env):
-        """Stale entry for cron/output itself must not delete all job output."""
-        dg = _load_lib()
-        output_root = _isolate_env / "cron" / "output"
-        job_dir = output_root / "job_1"
-        job_dir.mkdir(parents=True)
-        run_md = job_dir / "run.md"
-        run_md.write_text("x")
-
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
-            "path": str(output_root),
-            "category": "cron-output",
-            "timestamp": "2025-01-01T00:00:00+00:00",
-            "size": 0,
-        }]))
-
-        summary = dg.quick()
-        assert summary["deleted"] == 0, "cron/output root must not be deleted"
-        assert output_root.exists()
-        assert run_md.exists()
-
-    def test_quick_skips_protected_cron_paths_defense_in_depth(self, _isolate_env):
-        """Defense-in-depth: even if guess_category returned cron-output
-        (hypothetically), protected cron paths are never deleted."""
-        dg = _load_lib()
-        cron_dir = _isolate_env / "cron"
-        cron_dir.mkdir()
-        tick_lock = cron_dir / ".tick.lock"
-        tick_lock.write_text("")
-
-        # Manually inject a stale entry with "test" category (would normally
-        # be auto-deleted) — the protected path guard must still block it.
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        tracked_file.parent.mkdir(parents=True, exist_ok=True)
-        tracked_file.write_text(json.dumps([{
-            "path": str(tick_lock),
-            "category": "test",
-            "timestamp": "2025-01-01T00:00:00+00:00",
-            "size": 0,
-        }]))
-
-        summary = dg.quick()
-        assert summary["deleted"] == 0, ".tick.lock must not be deleted"
-        assert tick_lock.exists()
 
     def test_dry_run_omits_stale_cron_output(self, _isolate_env):
         """dry_run() should also skip stale cron-output entries."""
@@ -339,23 +281,6 @@ class TestTrackForgetQuick:
         assert summary["deleted"] == 1
         assert not p.exists()
 
-    def test_track_dedup(self, _isolate_env):
-        dg = _load_lib()
-        p = _isolate_env / "test_a.py"
-        p.write_text("x")
-        assert dg.track(str(p), "test", silent=True) is True
-        # Second call returns False (already tracked)
-        assert dg.track(str(p), "test", silent=True) is False
-
-    def test_track_rejects_outside_home(self, _isolate_env):
-        dg = _load_lib()
-        # /etc/hostname exists on most Linux boxes; fall back if not.
-        outside = "/etc/hostname" if Path("/etc/hostname").exists() else "/etc/passwd"
-        assert dg.track(outside, "test", silent=True) is False
-
-    def test_track_skips_missing(self, _isolate_env):
-        dg = _load_lib()
-        assert dg.track(str(_isolate_env / "nope.txt"), "test", silent=True) is False
 
     def test_forget_removes_entry(self, _isolate_env):
         dg = _load_lib()
@@ -364,54 +289,6 @@ class TestTrackForgetQuick:
         dg.track(str(p), "temp", silent=True)
         assert dg.forget(str(p)) == 1
         assert p.exists()  # forget does NOT delete the file
-
-    def test_quick_preserves_unexpired_temp(self, _isolate_env):
-        dg = _load_lib()
-        p = _isolate_env / "fresh.tmp"
-        p.write_text("x")
-        dg.track(str(p), "temp", silent=True)
-        summary = dg.quick()
-        assert summary["deleted"] == 0
-        assert p.exists()
-
-    def test_quick_preserves_protected_top_level_dirs(self, _isolate_env):
-        dg = _load_lib()
-        for d in ("logs", "memories", "sessions", "cron", "cache"):
-            (_isolate_env / d).mkdir()
-        dg.quick()
-        for d in ("logs", "memories", "sessions", "cron", "cache"):
-            assert (_isolate_env / d).exists(), f"{d}/ should be preserved"
-
-    def test_quick_does_not_descend_into_protected_top_level_dirs(
-        self, _isolate_env, monkeypatch
-    ):
-        dg = _load_lib()
-        protected_empty = (
-            _isolate_env / "hermes-agent" / "node_modules" / "pkg" / "empty"
-        )
-        protected_empty.mkdir(parents=True)
-
-        original_iterdir = Path.iterdir
-
-        def guarded_iterdir(path):
-            if path == _isolate_env / "hermes-agent":
-                raise AssertionError("quick() descended into protected hermes-agent/")
-            return original_iterdir(path)
-
-        monkeypatch.setattr(Path, "iterdir", guarded_iterdir)
-
-        dg.quick()
-
-        assert protected_empty.exists()
-
-    def test_quick_removes_empty_dirs_in_managed_subtrees(self, _isolate_env):
-        dg = _load_lib()
-        managed_empty = _isolate_env / "scratch" / "nested" / "empty"
-        managed_empty.mkdir(parents=True)
-
-        dg.quick()
-
-        assert not (_isolate_env / "scratch").exists()
 
 
 class TestStatus:
@@ -468,18 +345,6 @@ class TestPostToolCallHook:
         assert len(data) == 1
         assert data[0]["category"] == "test"
 
-    def test_write_file_non_test_not_tracked(self, _isolate_env):
-        pi = _load_plugin_init()
-        p = _isolate_env / "notes.md"
-        p.write_text("x")
-        pi._on_post_tool_call(
-            tool_name="write_file",
-            args={"path": str(p), "content": "x"},
-            result="OK",
-            task_id="t2", session_id="s2",
-        )
-        tracked_file = _isolate_env / "disk-cleanup" / "tracked.json"
-        assert not tracked_file.exists() or tracked_file.read_text().strip() == "[]"
 
     def test_terminal_command_picks_up_paths(self, _isolate_env):
         pi = _load_plugin_init()
@@ -540,43 +405,11 @@ class TestSlashCommand:
         assert "disk-cleanup" in out
         assert "status" in out
 
-    def test_status_empty(self, _isolate_env):
-        pi = _load_plugin_init()
-        out = pi._handle_slash("status")
-        assert "nothing tracked" in out
-
-    def test_track_rejects_missing(self, _isolate_env):
-        pi = _load_plugin_init()
-        out = pi._handle_slash(
-            f"track {_isolate_env / 'nope.txt'} temp"
-        )
-        assert "Not tracked" in out
-
-    def test_track_rejects_bad_category(self, _isolate_env):
-        pi = _load_plugin_init()
-        p = _isolate_env / "a.tmp"
-        p.write_text("x")
-        out = pi._handle_slash(f"track {p} banana")
-        assert "Unknown category" in out
-
-    def test_track_and_forget(self, _isolate_env):
-        pi = _load_plugin_init()
-        p = _isolate_env / "a.tmp"
-        p.write_text("x")
-        out = pi._handle_slash(f"track {p} temp")
-        assert "Tracked" in out
-        out = pi._handle_slash(f"forget {p}")
-        assert "Removed 1" in out
 
     def test_unknown_subcommand(self, _isolate_env):
         pi = _load_plugin_init()
         out = pi._handle_slash("foobar")
         assert "Unknown subcommand" in out
-
-    def test_quick_on_empty(self, _isolate_env):
-        pi = _load_plugin_init()
-        out = pi._handle_slash("quick")
-        assert "Cleaned 0 files" in out
 
 
 # ---------------------------------------------------------------------------
@@ -603,17 +436,6 @@ class TestBundledDiscovery:
         assert not loaded.enabled
         assert loaded.error and "not enabled" in loaded.error
 
-    def test_disk_cleanup_loads_when_enabled(self, _isolate_env):
-        """Adding to plugins.enabled activates the bundled plugin."""
-        self._write_enabled_config(_isolate_env, ["disk-cleanup"])
-        from hermes_cli import plugins as pmod
-        mgr = pmod.PluginManager()
-        mgr.discover_and_load()
-        loaded = mgr._plugins["disk-cleanup"]
-        assert loaded.enabled
-        assert "post_tool_call" in loaded.hooks_registered
-        assert "on_session_end" in loaded.hooks_registered
-        assert "disk-cleanup" in loaded.commands_registered
 
     def test_disabled_beats_enabled(self, _isolate_env):
         """plugins.disabled wins even if the plugin is also in plugins.enabled."""

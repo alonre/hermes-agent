@@ -66,24 +66,29 @@ class WABridgeMixin:
     # ------------------------------------------------------------------
 
     def _whatsapp_bridge_target(self, source: "SessionSource"):
-        """Return (wa_adapter, tg_adapter, tg_chat_id) if bridging applies, else None."""
+        """Return (wa_adapter, tg_adapter, tg_chat_id) if bridging applies, else None.
+
+        Defensive: callers include minimal/partial ``source`` and ``GatewayRunner``
+        test doubles (``object.__new__`` skipping ``__init__``) that lack ``platform``,
+        ``config``, or ``adapters`` — any of those simply means "not applicable".
+        """
         try:
             from gateway.config import Platform
-        except ImportError:
+            if getattr(source, "platform", None) != Platform.WHATSAPP or not getattr(source, "user_id", None):
+                return None
+            if source.user_id != source.chat_id:
+                return None
+            wa_cfg = self.config.platforms.get(Platform.WHATSAPP)  # type: ignore[attr-defined]
+            if not wa_cfg or not wa_cfg.extra.get("whatsapp_bridging"):
+                return None
+            wa_adapter = self.adapters.get(Platform.WHATSAPP)  # type: ignore[attr-defined]
+            tg_adapter = self.adapters.get(Platform.TELEGRAM)  # type: ignore[attr-defined]
+            tg_home = self.config.get_home_channel(Platform.TELEGRAM)  # type: ignore[attr-defined]
+            if not wa_adapter or not tg_adapter or not tg_home:
+                return None
+            return wa_adapter, tg_adapter, tg_home.chat_id
+        except Exception:
             return None
-        if source.platform != Platform.WHATSAPP or not source.user_id:
-            return None
-        if source.user_id != source.chat_id:
-            return None
-        wa_cfg = self.config.platforms.get(Platform.WHATSAPP)  # type: ignore[attr-defined]
-        if not wa_cfg or not wa_cfg.extra.get("whatsapp_bridging"):
-            return None
-        wa_adapter = self.adapters.get(Platform.WHATSAPP)  # type: ignore[attr-defined]
-        tg_adapter = self.adapters.get(Platform.TELEGRAM)  # type: ignore[attr-defined]
-        tg_home = self.config.get_home_channel(Platform.TELEGRAM)  # type: ignore[attr-defined]
-        if not wa_adapter or not tg_adapter or not tg_home:
-            return None
-        return wa_adapter, tg_adapter, tg_home.chat_id
 
     # ------------------------------------------------------------------
     # _handle_message lifecycle hooks

@@ -18,12 +18,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 @pytest.fixture()
 def file_tools_mod():
     import tools.file_tools as ft
-    # reset the module-level cache between tests
-    ft._allowed_write_roots_cached = None
-    ft._allowed_write_roots_loaded = False
+    import tools.file_tools_write_guards as wg
+    # reset the module-level cache between tests (lives in file_tools_write_guards,
+    # which file_tools imports _check_allowed_write_roots/_get_allowed_write_roots from)
+    wg._allowed_write_roots_cached = None
+    wg._allowed_write_roots_loaded = False
     yield ft
-    ft._allowed_write_roots_cached = None
-    ft._allowed_write_roots_loaded = False
+    wg._allowed_write_roots_cached = None
+    wg._allowed_write_roots_loaded = False
 
 
 def _set_roots(monkeypatch, ft, roots):
@@ -31,8 +33,9 @@ def _set_roots(monkeypatch, ft, roots):
         "hermes_cli.config.load_config",
         lambda: {"file_tools": {"allowed_write_roots": roots}},
     )
-    ft._allowed_write_roots_cached = None
-    ft._allowed_write_roots_loaded = False
+    import tools.file_tools_write_guards as wg
+    wg._allowed_write_roots_cached = None
+    wg._allowed_write_roots_loaded = False
 
 
 def test_unrestricted_when_unset(monkeypatch, file_tools_mod):

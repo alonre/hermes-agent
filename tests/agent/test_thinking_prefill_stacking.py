@@ -7,7 +7,7 @@ prefill message instead of appending another assistant message. llama.cpp
 stacked prefills turned every second retry into an HTTP 400.
 """
 
-from agent.conversation_loop import _append_thinking_prefill
+from agent.turn_empty_response import _append_thinking_prefill
 
 
 def _prefill(content="", reasoning=None):

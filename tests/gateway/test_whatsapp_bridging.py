@@ -219,7 +219,8 @@ class TestBridgedApprovalRedirect:
     @pytest.mark.asyncio
     async def test_approve_in_telegram_resolves_bridged_whatsapp_approval(self):
         from gateway.platforms.base import MessageEvent
-        from tools.approval import _ApprovalEntry, _gateway_queues
+        from tools.approval import _gateway_queues
+        from tools.approval_gateway_wait import _ApprovalEntry
 
         runner = _make_runner()
         runner._pending_approvals = {}
@@ -243,7 +244,8 @@ class TestBridgedApprovalRedirect:
     @pytest.mark.asyncio
     async def test_deny_in_telegram_resolves_bridged_whatsapp_approval(self):
         from gateway.platforms.base import MessageEvent
-        from tools.approval import _ApprovalEntry, _gateway_queues
+        from tools.approval import _gateway_queues
+        from tools.approval_gateway_wait import _ApprovalEntry
 
         runner = _make_runner()
         runner._pending_approvals = {}
