@@ -1073,7 +1073,15 @@ registry.register(
     handler=_handle_video_analyze,
     check_fn=check_video_requirements,
     is_async=True,
-    emoji="🎬")
+    emoji="🎬",
+)
+# NOTE (reverted 2026-06-19): same accidental change as the browser tools
+# (commit 2bd047e23) — vision_analyze was deregistered "moved to vision-agent
+# sub-agent" which doesn't exist here. Re-enabled; check_vision_requirements()
+# gates it, so it only advertises when a vision provider is configured (e.g.
+# the visual-analysis specialist on local-vision), staying off for profiles
+# with no vision provider.
+# registry.deregister("vision_analyze")
 
 
 # ---- BEGIN PLUGIN-COMPAT (revert-scheduled; see COMPAT_MANIFEST.md) ----

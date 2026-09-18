@@ -347,6 +347,14 @@ class GatewayNotificationsMixin:
         ``event_message_id`` reply anchor); see ``_send_queued_final_text``. Without a key the send
         stays unledgered."""
         from gateway.run import _strip_response_attachments_for_direct_send
+        # WhatsApp self-send bridging: redirect delivery to the Telegram home channel. A shallow
+        # source copy (chat_id only) keeps session/ledger identity (session_key, inbound_message_id)
+        # intact while every downstream ``source.chat_id`` read targets the right chat. ``_bridged``
+        # lives on WABridgeMixin — absent on a bare GatewayNotificationsMixin test double.
+        _bridged = getattr(self, "_bridged", None)
+        adapter, _chat_id = _bridged(source, adapter, source.chat_id) if _bridged else (adapter, source.chat_id)
+        if _chat_id != source.chat_id:
+            source = dataclasses.replace(source, chat_id=_chat_id)
         if not text_already_delivered:
             text_content = _strip_response_attachments_for_direct_send(response, adapter)
             if text_content:

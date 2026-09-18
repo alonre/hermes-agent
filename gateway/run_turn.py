@@ -2970,7 +2970,10 @@ class GatewayTurnMixin:
         _cleanup_progress = bool(
             disp.resolve_display_setting(disp.user_config, disp.platform_key, "cleanup_progress")
         )
-        _cleanup_adapter = self._adapter_for_source(source) if _cleanup_progress else None
+        _cleanup_adapter, _cleanup_chat_id = (
+            self._bridged(source, self._adapter_for_source(source), source.chat_id)
+            if _cleanup_progress else (None, None)
+        )
         if _cleanup_adapter is not None and getattr(type(_cleanup_adapter), "delete_message", None) in (
             None, BasePlatformAdapter.delete_message,
         ):
@@ -2981,6 +2984,7 @@ class GatewayTurnMixin:
         turn_ctx = TurnContext(
             source=source, message=message, AIAgent=AIAgent, session_key=session_key,
             run_generation=run_generation, _cleanup_progress=_cleanup_progress,
+            _cleanup_chat_id=_cleanup_chat_id,
             _run_still_current=self._run_still_current_fn(session_key, run_generation),
             progress_queue=queue.Queue() if disp.needs_progress_queue else None,
             _voice_ack_guild=_voice_ack_guild, _voice_ack_loop=asyncio.get_running_loop(),
@@ -3393,12 +3397,12 @@ class GatewayTurnMixin:
     async def _run_agent_inactivity_warning(self, worker, source, _status_thread_metadata) -> None:
         """Staged one-shot warning before the inactivity timeout escalates."""
         from gateway.run import _interim_metadata
-        _warn_adapter = self._adapter_for_source(source)
+        _warn_adapter, _warn_chat_id = self._bridged(source, self._adapter_for_source(source), source.chat_id)
         if not _warn_adapter:
             return
         try:
             await _warn_adapter.emit_warning(
-                source.chat_id, f"⚠️ I seem to be stuck (no activity for {int(worker.agent_warning // 60) or 1} min). "
+                _warn_chat_id, f"⚠️ I seem to be stuck (no activity for {int(worker.agent_warning // 60) or 1} min). "
                 "If nothing happens in the next "
                 f"{int((worker.agent_timeout - worker.agent_warning) // 60) or 1} min I'll give up on this task. "
                 "You can keep waiting, send /stop to cancel it, or /new to start a fresh conversation.",
@@ -3746,8 +3750,9 @@ class GatewayTurnMixin:
 
         # Restart the typing indicator; the outer typing task may be stale.
         if _clear_adapter:
+            _followup_adapter, _followup_chat_id = self._bridged(source, _clear_adapter, source.chat_id)
             with suppress(Exception):
-                await _clear_adapter.send_typing(source.chat_id, metadata=_status_thread_metadata)
+                await _followup_adapter.send_typing(_followup_chat_id, metadata=_status_thread_metadata)
 
         # Re-baseline the cached agent's message_count before recursing, else the coherence guard
         # rebuilds on OUR OWN flushed rows (the outer handler re-baselines only after the chain).
@@ -3862,7 +3867,8 @@ class GatewayTurnMixin:
         returned failure as ``(session, error)``; ``fail_exc`` logs an exception as ``(session, exc)``."""
         try:
             _res = await _sc.adapter.edit_message(
-                chat_id=source.chat_id, message_id=_sc.message_id, content=content, finalize=True,
+                chat_id=self._bridged(source, _sc.adapter, source.chat_id)[1],
+                message_id=_sc.message_id, content=content, finalize=True,
             )
         except Exception as _edit_err:
             logger.warning(fail_exc, _sk, _edit_err)
@@ -3976,7 +3982,7 @@ class GatewayTurnMixin:
         ):
             return
         _ids_snapshot = list(_cleanup_msg_ids)
-        _chat_id_snapshot = turn_ctx.source.chat_id
+        _chat_id_snapshot = turn_ctx._cleanup_chat_id
         _loop_snapshot = asyncio.get_running_loop()
 
         def _cleanup_temp_bubbles() -> None:
@@ -4004,8 +4010,11 @@ class GatewayTurnMixin:
         """Resolve progress threading, then publish progress metadata and the sync→async bridges onto
         ``turn_ctx`` (the one-slot holders shared with run_sync's executor thread are TurnContext
         defaults). Returns ``_status_thread_metadata``."""
-        turn_ctx._progress_metadata, turn_ctx._progress_reply_to, _status_thread_metadata = (
+        _progress_metadata, _progress_reply_to, _status_thread_metadata = (
             self._run_agent_progress_threading(source, event_message_id, _native_slack_task_cards)
+        )
+        _, turn_ctx._progress_metadata, turn_ctx._progress_reply_to = self._apply_bridge_progress_context(
+            source, None, _progress_metadata, _progress_reply_to,
         )
         # Bridges: sync step/event/status callbacks → async hooks.emit and adapter.send.
         turn_ctx._loop_for_step = asyncio.get_running_loop()
@@ -4013,8 +4022,11 @@ class GatewayTurnMixin:
         turn_ctx._step_callback_sync = turn_runner._step_callback_sync
         turn_ctx._event_callback_sync = turn_runner._event_callback_sync
         turn_ctx._status_callback_sync = turn_runner._status_callback_sync
-        turn_ctx._status_adapter = self._adapter_for_source(source)
-        turn_ctx._status_chat_id = source.chat_id
+        turn_ctx._status_adapter, turn_ctx._status_chat_id, _status_thread_metadata = (
+            self._apply_bridge_status_target(
+                source, self._adapter_for_source(source), source.chat_id, _status_thread_metadata,
+            )
+        )
         turn_ctx._status_thread_metadata = _status_thread_metadata
         return _status_thread_metadata
 
@@ -4035,7 +4047,7 @@ class GatewayTurnMixin:
             return
         source, session_key, agent_holder = turn_ctx.source, turn_ctx.session_key, turn_ctx.agent_holder
         _status_thread_metadata = turn_ctx._status_thread_metadata
-        _notify_adapter = self._adapter_for_source(source)
+        _notify_adapter, _notify_chat_id = self._bridged(source, self._adapter_for_source(source), source.chat_id)
         if not _notify_adapter:
             return
         _heartbeat_msg_id: Optional[str] = None
@@ -4071,7 +4083,7 @@ class GatewayTurnMixin:
                 _notify_res = None
                 if _heartbeat_msg_id:
                     try:
-                        _notify_res = await _notify_adapter.edit_message(source.chat_id, _heartbeat_msg_id, _heartbeat_text)
+                        _notify_res = await _notify_adapter.edit_message(_notify_chat_id, _heartbeat_msg_id, _heartbeat_text)
                     except Exception as _ee:
                         logger.debug("Heartbeat edit failed: %s", _ee)
                         _notify_res = None
@@ -4083,7 +4095,7 @@ class GatewayTurnMixin:
                     ):
                         break
                     _notify_res = await _notify_adapter.send(
-                        source.chat_id, _heartbeat_text,
+                        _notify_chat_id, _heartbeat_text,
                         metadata=_interim_metadata(_non_conversational_metadata(_status_thread_metadata, platform=source.platform)),
                     )
                     if getattr(_notify_res, "success", False) and getattr(_notify_res, "message_id", None):

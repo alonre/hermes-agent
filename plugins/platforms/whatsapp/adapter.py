@@ -628,6 +628,25 @@ class WhatsAppAdapter(WhatsAppBehaviorMixin, BasePlatformAdapter):
             rich_sent_store.record_media(jid, result.message_id, [(file_path, mime or "application/octet-stream")])
         return result
 
+    async def send_reaction(self, chat_id: str, message_id: str, reaction: str) -> bool:
+        """React to a message via the bridge's /reaction endpoint.
+
+        Used for WhatsApp self-send bridging: the gateway acks a self-chat
+        message with a "still working" emoji, then swaps it for a
+        success/failure emoji once the response has been delivered through
+        the home channel.
+        """
+        if not message_id or await self._bridge_unavailable():
+            return False
+        try:
+            async with self._bridge_req(
+                "post", "reaction", 10,
+                json={"chatId": chat_id, "messageId": message_id, "reaction": reaction},
+            ) as resp:
+                return resp.status == 200
+        except Exception:
+            return False
+
     @_needs_bridge
     async def send_poll(self, chat_id: str, question: str, options: list[str], *, selectable_count: int = 1) -> SendResult:
         """Native WhatsApp poll (low-level transport primitive; approval UX stays gateway-owned)."""

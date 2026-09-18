@@ -634,6 +634,17 @@ def _blocked_tool_result(agent, ref: _ToolCallRef, *, block_message: Optional[st
     return result
 
 
+def _tool_gate_blocked_result(agent, ref: _ToolCallRef, gate: dict) -> str:
+    """Synthesize the result for a call held by the generic tool-approval gate (config-driven;
+    default OFF — see ``tools.approval.check_tool_approval``) and emit its terminal post_tool_call.
+    ``"staged"`` is a non-error defer (Kanban/deferred approval); anything else is a hard block."""
+    status = gate.get("status", "blocked")
+    error_key = "error" if status == "blocked" else "message"
+    result = json.dumps({"status": status, error_key: gate.get("message")}, ensure_ascii=False)
+    ref.emit_post(agent, result, status=status, error_type="tool_approval_gate", error_message=gate.get("message"))
+    return result
+
+
 def _pre_tool_block(agent, ref: _ToolCallRef):
     """Run ``pre_tool_call`` plugin hooks; returns ``(block_message, final_args)`` with any
     hook-modified args applied. Hook failures never block."""
@@ -694,6 +705,20 @@ def _dispatch_authorized_once(
             agent, ref,
             block_message=block_message, block_error_type=block_error_type, guardrail_decision=guardrail_decision,
         )
+
+    # Generic tool-approval gate (config-driven; default OFF). Single choke point for
+    # both dispatch paths, which now share this function.
+    try:
+        from tools.approval import check_tool_approval
+        gate = check_tool_approval(ref.name, ref.args)
+    except Exception as gate_err:
+        logger.debug("tool approval gate error: %s", gate_err)
+        gate = {"approved": True}
+
+    if gate.get("approved") is False:
+        _advance_start_order()
+        state.blocked = True
+        return _tool_gate_blocked_result(agent, ref, gate)
 
     if ref.name == "memory":
         agent._turns_since_memory = 0

@@ -558,15 +558,22 @@ def _redact_approval_command(cmd: "str | None") -> str:
 
 def _format_exec_approval_fallback(
     command: str, description: str, command_prefix: str, *, allow_permanent: bool = True,
-    allow_session: bool = True, smart_denied: bool = False) -> str:
+    allow_session: bool = True, smart_denied: bool = False, tool_name: "str | None" = None) -> str:
     """Render the text fallback from approval capabilities, not platform names. Same words as
     the button card (``BasePlatformAdapter._format_exec_approval``), plus the typed ``/approve``
     steps a surface without buttons needs."""
     from gateway.platforms.base_exec_approval import (
         EA_HEADER_TEXT, EA_REASON_LABEL_TEXT, approval_timeout_seconds, format_approval_deadline_line)
     cmd_preview = command[:200] + "..." if len(command) > 200 else command
-    heading = ("⚠️ **Smart DENY — owner override for one operation:**" if smart_denied
-               else f"⚠️ **{EA_HEADER_TEXT}**")
+    if tool_name is not None:
+        # Tool-gate approvals carry kind="tool" + tool_name; render a
+        # tool-flavoured header instead of "Dangerous command" so the
+        # prompt matches what's actually being approved (§6a).
+        heading = f"⚠️ **Approval required to run `{tool_name}`:**"
+    elif smart_denied:
+        heading = "⚠️ **Smart DENY — owner override for one operation:**"
+    else:
+        heading = f"⚠️ **{EA_HEADER_TEXT}**"
 
     choices = [f"Reply `{command_prefix}approve` to run it once"]
     if not smart_denied and allow_session:
@@ -3214,6 +3221,9 @@ def _reconnect_needs_attention(info: dict, now: float) -> bool:
     return (now - queued_at) >= _RECONNECT_ATTENTION_AFTER_SECONDS
 
 
+from gateway.platforms._wa_bridging import WABridgeMixin as _WABridgeMixin
+
+
 # "No session DB pinned": lets ``_session_db`` distinguish "resolve from profile scope" from a
 # deliberate ``runner._session_db = None`` (disables DB commands). Mirrors gateway.session._DB_UNPINNED.
 _SESSION_DB_UNPINNED = object()
@@ -3298,7 +3308,7 @@ def _instantiate_builtin_adapter(platform: Platform, config: Any) -> Optional[Ba
 
 
 class GatewayRunner(
-    GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin,
+    _WABridgeMixin, GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin,
     GatewayVoiceMixin, GatewayAdapterLifecycleMixin, GatewayTopicThreadsMixin, GatewayTurnMixin,
     GatewayShutdownMixin, GatewayBusySessionMixin, GatewayConfigLoadersMixin, GatewayStartupMixin,
     GatewaySessionWatchersMixin, GatewayNotificationsMixin, GatewayInboundMixin, GatewayGoalsMixin,
@@ -3546,6 +3556,8 @@ class GatewayRunner(
         # Teams meeting pipeline runtime (bound later when msgraph_webhook adapter exists).
         self._teams_pipeline_runtime = None
         self._teams_pipeline_runtime_error: Optional[str] = None
+        self._init_wa_bridge_state()  # WABridgeMixin: approval-redirect dict + bridge state
+
         # Failed-to-connect platforms for background reconnection: Platform -> {config, attempts, next_retry}
         self._failed_platforms: Dict[Platform, Dict[str, Any]] = {}
         # Strong refs to detached fatal-error handler tasks so the loop can't GC them mid-run.

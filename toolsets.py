@@ -13,7 +13,14 @@ _HERMES_CORE_TOOLS = [
     "terminal", "process_manage",
     "read_file", "write_file", "patch", "search_files",
     "vision_analyze", "image_generate",
-    "skills_list", "skill_view", "skill_manage",
+    # Skills. skill_discover/skill_acquire are the fork's discovery + trust-gated
+    # hub-install tools (#718d3bd42); they belong to the `skills` toolset, so they
+    # must be in core too — otherwise the `skills` toolset is a superset of the
+    # hermes-cli composite and never reverse-maps as enabled (it silently shows
+    # disabled, and the two tools are unreachable in a default CLI session).
+    # Both self-gate at runtime (check_fn / trust-staging), so default exposure is safe.
+    "skills_list", "skill_view", "skill_manage", "skill_discover", "skill_acquire",
+    # Browser automation
     "browser_navigate", "browser_snapshot", "browser_click",
     "browser_type", "browser_scroll", "browser_back",
     "browser_press", "browser_get_images",
@@ -34,6 +41,11 @@ _HERMES_CORE_TOOLS = [
     "kanban_comment", "kanban_create", "kanban_link",
     "kanban_unblock",
     "kanban_attach", "kanban_attach_url", "kanban_attachments",
+    # PaperClip work-protocol tools — only in schema when the agent's
+    # environment carries PAPERCLIP_AGENT_API_KEY (every PaperClip-onboarded
+    # profile). Gated via check_fn in tools/paperclip_tools.py.
+    "paperclip_set_disposition", "paperclip_create_issue",
+    # Computer use (macOS, gated on cua-driver being installed via check_fn)
     "computer_use",
     # Service-gated connector account status and authorization links.
     "manage_connections",
@@ -101,7 +113,7 @@ TOOLSETS = {
     "skills": _ts(
         "Access, create, edit, and manage skill documents with specialized "
         "instructions and knowledge",
-        ["skills_list", "skill_view", "skill_manage"],
+        ["skills_list", "skill_view", "skill_manage", "skill_discover", "skill_acquire"],
     ),
     # web_search belongs to `web`/`search` only. Listing it here too let
     # `disabled_toolsets: [browser]` (headless/Docker deployments) strip
@@ -154,6 +166,14 @@ TOOLSETS = {
         "block for human input, heartbeat during long ops, comment on threads, attach "
         "files, and (for orchestrators) list, unblock, and fan out tasks.",
         [t for t in _HERMES_CORE_TOOLS if t.startswith("kanban_")],
+    ),
+    "paperclip": _ts(
+        "PaperClip work-protocol tools — only active when the agent's environment "
+        "carries PAPERCLIP_AGENT_API_KEY (every PaperClip-onboarded profile, wired "
+        "in by the console's provisioning step). Lets a woken agent record its "
+        "mandatory final disposition and create tracked delegate/consult issues "
+        "without needing a terminal tool.",
+        ["paperclip_set_disposition", "paperclip_create_issue"],
     ),
     "discord": _ts("Discord read and participate tools (fetch messages, search members, create threads)", ["discord"]),
     "discord_admin": _ts("Discord server management (list channels/roles, pin messages, assign roles)", ["discord_admin"]),

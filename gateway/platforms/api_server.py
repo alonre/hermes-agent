@@ -4,6 +4,10 @@ Serves /v1/chat/completions, /v1/responses, /v1/models, /v1/capabilities, /api/s
 /v1/runs, /api/jobs and /health* (full table: ``APIServerAdapter._http_route_table``); any
 OpenAI-compatible frontend connects at http://localhost:8642/v1 with API_SERVER_KEY. Under
 ``gateway.multiplex_profiles`` secondary profiles live at ``/p/<profile>/...``.
+
+The Master Console API surface (kanban, staged tool-gate actions, config/profiles/gateway,
+soul) is registered separately by ``gateway.platforms._console_routes`` — see that module's
+docstring for its route table.
 """
 
 import asyncio
@@ -70,7 +74,8 @@ _STATIC_FEATURE_FLAGS = {
     "session_resources": True, "model_options": True, "session_chat": True,
     "session_chat_streaming": True, "session_fork": True, "session_model_lock": True,
     "admin_config_rw": False, "jobs_admin": False, "memory_write_api": False,
-    "skills_api": True, "audio_api": False, "realtime_voice": False,
+    "skills_api": True, "kanban_api": True, "kanban_read": True, "kanban_write": True,
+    "audio_api": False, "realtime_voice": False,
     "session_continuity_header": "X-Hermes-Session-Id",
     "session_key_header": "X-Hermes-Session-Key"}
 # /v1/capabilities "endpoints" table: name -> (method, path).
@@ -83,7 +88,12 @@ _CAPABILITY_ENDPOINTS = (
     ("run_events", ("GET", "/v1/runs/{run_id}/events")),
     ("run_approval", ("POST", "/v1/runs/{run_id}/approval")),
     ("run_steer", ("POST", "/v1/runs/{run_id}/steer")),
-    ("run_stop", ("POST", "/v1/runs/{run_id}/stop")), ("skills", ("GET", "/v1/skills")),
+    ("run_stop", ("POST", "/v1/runs/{run_id}/stop")),
+    ("actions", ("GET", "/v1/actions")),
+    ("action_detail", ("GET", "/v1/actions/{pending_id}")),
+    ("action_approve", ("POST", "/v1/actions/{pending_id}/approve")),
+    ("action_reject", ("POST", "/v1/actions/{pending_id}/reject")),
+    ("skills", ("GET", "/v1/skills")),
     ("toolsets", ("GET", "/v1/toolsets")), ("sessions", ("GET", "/api/sessions")),
     ("session_create", ("POST", "/api/sessions")),
     ("session", ("GET", "/api/sessions/{session_id}")),
@@ -97,7 +107,15 @@ _CAPABILITY_ENDPOINTS = (
     ("browser_control_register", ("POST", "/v1/browser-control/register")),
     ("browser_control_ws", ("GET", "/v1/browser-control/ws")),
     ("artifact_upload", ("POST", "/v1/artifacts/upload")),
-    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")))
+    ("artifact_download", ("GET", "/v1/artifacts/download/{artifact_id}")),
+    ("kanban_tasks", ("GET", "/api/kanban/tasks")),
+    ("kanban_task_create", ("POST", "/api/kanban/tasks")),
+    ("kanban_task", ("GET", "/api/kanban/tasks/{task_id}")),
+    ("kanban_task_patch", ("PATCH", "/api/kanban/tasks/{task_id}")),
+    ("kanban_task_assign", ("POST", "/api/kanban/tasks/{task_id}/assign")),
+    ("kanban_task_comment", ("POST", "/api/kanban/tasks/{task_id}/comment")),
+    ("kanban_assignees", ("GET", "/api/kanban/assignees")),
+    ("kanban_dispatch_state", ("GET", "/api/kanban/dispatch/state")))
 _BROWSER_CONTROL_WS_PROTOCOL = "hermes-browser-control-v1"
 _BROWSER_CONTROL_TICKET_PROTOCOL_PREFIX = "hermes-browser-control-ticket."
 
@@ -1037,14 +1055,14 @@ try:
     from cron.jobs import (
         list_jobs as _cron_list, get_job as _cron_get, update_job as _cron_update,
         remove_job as _cron_remove, pause_job as _cron_pause, resume_job as _cron_resume,
-        trigger_job as _cron_trigger)
+        trigger_job as _cron_trigger, list_job_runs as _cron_list_runs)
     from cron.scheduler import (
         CronSchedulerRegistrationError as _CronSchedulerRegistrationError,
         create_job_with_scheduler_registration as _cron_create)
     _CRON_AVAILABLE = True
 except ImportError:
     _cron_list = _cron_get = _cron_create = _cron_update = None
-    _cron_remove = _cron_pause = _cron_resume = _cron_trigger = None
+    _cron_remove = _cron_pause = _cron_resume = _cron_trigger = _cron_list_runs = None
 
     class _CronSchedulerRegistrationError(RuntimeError):
         pass
@@ -1574,6 +1592,7 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             ("GET", "/api/jobs", self._handle_list_jobs),
             ("POST", "/api/jobs", self._handle_create_job),
             ("GET", "/api/jobs/{job_id}", self._handle_get_job),
+            ("GET", "/api/jobs/{job_id}/runs", self._handle_job_runs),
             ("PATCH", "/api/jobs/{job_id}", self._handle_update_job),
             ("DELETE", "/api/jobs/{job_id}", self._handle_delete_job),
             ("POST", "/api/jobs/{job_id}/pause", self._handle_pause_job),
@@ -2670,7 +2689,20 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         except Exception:
             logger.exception("GET /v1/skills failed")
             return _error_response("Failed to enumerate skills", 500, err_type="server_error")
-        return web.json_response({"object": "list", "data": skills})
+
+        body = {"object": "list", "data": skills}
+        # ?include=files&names=a,b,c: attach live file contents for the named
+        # skills (the caller's version-controlled set) so a remote drift diff
+        # matches a local one. Scoped to names to keep the payload small.
+        if request.query.get("include", "").lower() == "files":
+            names = [n.strip() for n in request.query.get("names", "").split(",") if n.strip()]
+            try:
+                from tools.skills_tool import read_skill_files
+                body["files"] = read_skill_files(names)
+            except Exception:
+                logger.exception("GET /v1/skills?include=files failed")
+                body["files"] = {}
+        return web.json_response(body)
 
     @_require_auth
     async def _handle_toolsets(self, request: "web.Request") -> "web.Response":
@@ -3323,9 +3355,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
 
     _JOB_ID_RE = re.compile(r"[a-f0-9]{12}")
     # Update whitelist — prevents clients injecting arbitrary keys.
-    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled"}
+    _UPDATE_ALLOWED_FIELDS = {"name", "schedule", "prompt", "deliver", "skills", "skill", "repeat", "enabled",
+                              "responsibility_id"}
     _MAX_NAME_LENGTH = 200
     _MAX_PROMPT_LENGTH = 5000
+    _MAX_RESPONSIBILITY_ID_LENGTH = 128
 
     def _cron_request_guard(
         self, request: "web.Request", *, need_job_id: bool = False, check_draining: bool = False,
@@ -3386,7 +3420,25 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             return err
         try:
             include_disabled = request.query.get("include_disabled", "").lower() in {"true", "1"}
-            return web.json_response({"jobs": _cron_list(include_disabled=include_disabled)})
+            jobs = _cron_list(include_disabled=include_disabled)
+            # ?include=runs[&days=N]: fold each job's per-run outcomes (windowed)
+            # + its newest run so dashboards can compute health without reading
+            # the cron output directory off disk. Summaries only (no bodies);
+            # full output files come from /api/jobs/{id}/runs.
+            if request.query.get("include", "").lower() == "runs" and _cron_list_runs:
+                try:
+                    days = int(request.query.get("days", "7"))
+                except ValueError:
+                    days = 7
+                days = max(1, min(days, 90))
+                for job in jobs:
+                    jid = job.get("id") or ""
+                    runs = _cron_list_runs(jid, days=days)
+                    job["recent_runs"] = runs
+                    job["last_run"] = (
+                        runs[0] if runs else next(iter(_cron_list_runs(jid, limit=1)), None)
+                    )
+            return web.json_response({"jobs": jobs})
         except Exception as e:
             return self._cron_error_response(e)
 
@@ -3436,6 +3488,36 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
         """GET /api/jobs/{job_id} — get a single cron job."""
         return await self._job_lookup_or_mutate(request, _cron_get, notify=False)
 
+    async def _handle_job_runs(self, request: "web.Request") -> "web.Response":
+        """GET /api/jobs/{job_id}/runs — per-run history WITH the output bodies.
+
+        Returns the actual run-output files (newest first) so a dashboard can
+        show the full log of any run, not just the latest status. Query:
+        ``limit`` (default 20, ≤100), ``days`` (trailing window). Each record:
+        ``{ts, status, error, content}``.
+        """
+        job_id, err = self._cron_request_guard(request, need_job_id=True)
+        if err:
+            return err
+        if not _cron_list_runs:
+            return web.json_response({"error": "Cron run history unavailable"}, status=503)
+        try:
+            limit = int(request.query.get("limit", "20"))
+        except ValueError:
+            limit = 20
+        limit = max(1, min(limit, 100))
+        days = None
+        if "days" in request.query:
+            try:
+                days = max(1, min(int(request.query["days"]), 90))
+            except ValueError:
+                days = None
+        try:
+            runs = _cron_list_runs(job_id, days=days, limit=limit, include_content=True)
+            return web.json_response({"job_id": job_id, "runs": runs})
+        except Exception as e:
+            return web.json_response({"error": str(e)}, status=500)
+
     async def _handle_update_job(self, request: "web.Request") -> "web.Response":
         """PATCH /api/jobs/{job_id} — update a cron job."""
         job_id, err = self._cron_request_guard(request, need_job_id=True)
@@ -3453,6 +3535,17 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
                 prompt_err = self._validate_cron_prompt(sanitized["prompt"])
                 if prompt_err:
                     return prompt_err
+            # responsibility_id: a slug/sentinel string, or null to clear (untriaged).
+            if "responsibility_id" in sanitized:
+                rid = sanitized["responsibility_id"]
+                if rid is not None and (
+                    not isinstance(rid, str) or len(rid) > self._MAX_RESPONSIBILITY_ID_LENGTH
+                ):
+                    return web.json_response(
+                        {"error": f"responsibility_id must be a string ≤ "
+                                  f"{self._MAX_RESPONSIBILITY_ID_LENGTH} characters, or null"},
+                        status=400,
+                    )
         except Exception as e:
             return self._cron_error_response(e)
         return self._job_response(lambda jid: _cron_update(jid, sanitized), job_id, notify=True)
@@ -3961,6 +4054,11 @@ class APIServerAdapter(OpenAICompatRoutesMixin, BasePlatformAdapter):
             for method, path, handler in self._http_route_table():
                 self._app.router.add_route(method, path, handler)
                 self._app.router.add_route(method, f"/p/{{profile}}{path}", handler)
+            # Console API routes (kanban, actions, config/profiles, soul) are
+            # registered via a fork-private seam module so future upstream edits
+            # to connect() never conflict with this block.
+            from gateway.platforms import _console_routes
+            _console_routes.register(self)
             # Registered LAST so every native mirror above wins: anything else under /p/<profile>/ is a
             # secondary profile's inbound-port platform (Twilio, LINE, Teams, ...) served on this listener.
             self._app.router.add_route("*", "/p/{profile}/{tail:.*}", self._handle_profile_ingress)

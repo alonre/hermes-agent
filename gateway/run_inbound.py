@@ -1323,9 +1323,14 @@ class GatewayInboundMixin:
         self._persist_active_agents()
         _run_generation = self._begin_session_run_generation(_quick_key)
 
+        await self._pre_agent(event, source)
         try:
             try:
-                _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+                try:
+                    _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+                except Exception:
+                    await self._on_agent_error(event, source)
+                    raise
             except TurnLeaseTimeoutError as exc:
                 # A rejected message, not a completed turn: return before the /goal judge so it
                 # cannot consume the resend notice and enqueue a synthetic continuation loop.
@@ -1346,7 +1351,7 @@ class GatewayInboundMixin:
                 )
             except Exception as _goal_exc:
                 logger.debug("post-turn hook failed: %s", _goal_exc)
-            return _agent_result
+            return await self._post_agent(event, source, _agent_result)
         finally:
             # One-shot restore (/moa, /model --once) must run on EVERY exit path (success,
             # exception, interrupt); the generation guard makes a displaced turn's finalizer a no-op.

@@ -429,8 +429,14 @@ _CONTEXT_LENGTH_KEYS = (
 )
 _MAX_COMPLETION_KEYS = ("max_completion_tokens", "max_output_tokens", "max_tokens")
 _LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1", "0.0.0.0")
-# Docker / Podman / Lima DNS names that resolve to the host machine
-_CONTAINER_LOCAL_SUFFIXES = (".docker.internal", ".containers.internal", ".lima.internal")
+# Docker / Podman / Lima DNS names that resolve to the host machine.
+# .local is the IANA-reserved mDNS/Bonjour TLD — always a LAN device.
+_CONTAINER_LOCAL_SUFFIXES = (
+    ".docker.internal",
+    ".containers.internal",
+    ".lima.internal",
+    ".local",
+)
 
 
 def _normalize_base_url(base_url: str) -> str:

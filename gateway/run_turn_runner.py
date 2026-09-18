@@ -320,6 +320,7 @@ class TurnRunner:
     class _TaskCardState:
         """Task-card rail state for ``_send_native_task_card_progress``."""
         adapter: Any
+        chat_id: Any = None
         tasks: Dict[str, Dict[str, str]] = dataclasses.field(default_factory=dict)
         task_order: List[str] = dataclasses.field(default_factory=list)
         fallback_msg_id: Optional[str] = None
@@ -496,7 +497,7 @@ class TurnRunner:
         See #29483.
         """
         ctx = self._ctx
-        st = self._TaskCardState(adapter)
+        st = self._TaskCardState(adapter, chat_id=ctx.source.chat_id)
         try:
             while ctx._run_still_current():
                 try:
@@ -528,6 +529,7 @@ class TurnRunner:
     class _ProgressEditState:
         """Mutable editable-bubble state shared by ``send_progress_messages`` and its helpers."""
         adapter: Any
+        chat_id: Any
         progress_lines: list
         progress_msg_id: Any
         can_edit: bool
@@ -535,7 +537,7 @@ class TurnRunner:
         _PROGRESS_TEXT_LIMIT: int
         _edit_accepts_metadata: bool
 
-    def _progress_edit_state(self, adapter) -> "TurnRunner._ProgressEditState":
+    def _progress_edit_state(self, adapter, chat_id) -> "TurnRunner._ProgressEditState":
         ctx = self._ctx
         len_fn = adapter.message_len_fn if isinstance(adapter, BasePlatformAdapter) else len
         try:
@@ -546,10 +548,10 @@ class TurnRunner:
         # chat's underlying platform; native adapters return their scalar/property unchanged.
         if isinstance(adapter, BasePlatformAdapter):
             with suppress(Exception):
-                raw_limit = int(adapter.max_message_length_for_chat(ctx.source.chat_id) or 4000)
-                len_fn = adapter.message_len_fn_for_chat(ctx.source.chat_id)
+                raw_limit = int(adapter.max_message_length_for_chat(chat_id) or 4000)
+                len_fn = adapter.message_len_fn_for_chat(chat_id)
         return self._ProgressEditState(
-            adapter=adapter, progress_lines=[], progress_msg_id=None,
+            adapter=adapter, chat_id=chat_id, progress_lines=[], progress_msg_id=None,
             # "separate" = one message per tool (pre-v0.9 behavior)
             can_edit=ctx.progress_grouping != "separate",
             _progress_len_fn=len_fn,
@@ -561,7 +563,7 @@ class TurnRunner:
 
     async def _edit_progress_message(self, st, message_id: str, content: str):
         ctx = self._ctx
-        kwargs = {"chat_id": ctx.source.chat_id, "message_id": message_id, "content": content}
+        kwargs = {"chat_id": st.chat_id, "message_id": message_id, "content": content}
         if getattr(st.adapter, "REQUIRES_EDIT_FINALIZE", False):
             kwargs["finalize"] = True
         if st._edit_accepts_metadata:
@@ -587,7 +589,7 @@ class TurnRunner:
     async def _send_progress_text(self, st, text: str):
         ctx = self._ctx
         result = await st.adapter.send(
-            chat_id=ctx.source.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
+            chat_id=st.chat_id, content=text, reply_to=ctx._progress_reply_to, metadata=ctx._progress_metadata,
         )
         self._track_progress_result(result)
         return result
@@ -671,7 +673,7 @@ class TurnRunner:
         ctx = self._ctx
         await asyncio.sleep(0.3)
         if ctx._run_still_current():
-            await st.adapter.send_typing(ctx.source.chat_id, metadata=ctx._progress_metadata)
+            await st.adapter.send_typing(st.chat_id, metadata=ctx._progress_metadata)
 
     async def _progress_send_or_edit(self, st, msg) -> bool:
         """Deliver this tick's bubble. Returns False on a transient edit failure (retry next tick).
@@ -713,7 +715,8 @@ class TurnRunner:
         if adapter_edit is None or adapter_edit is BasePlatformAdapter.edit_message:
             self._drain_progress_queue()
             return
-        st = self._progress_edit_state(adapter)
+        adapter, chat_id = self._runner._bridged(ctx.source, adapter, ctx.source.chat_id)
+        st = self._progress_edit_state(adapter, chat_id)
         last_edit_ts = 0.0
         EDIT_INTERVAL = 1.5  # Minimum seconds between edits (Telegram flood control)
         while True:
@@ -926,11 +929,12 @@ class TurnRunner:
                 from gateway.stream_consumer import GatewayStreamConsumer
                 adapter = self._runner._adapter_for_source(ctx.source)
                 if adapter:
+                    adapter, _sc_chat_id = self._runner._bridged(ctx.source, adapter, ctx.source.chat_id)
                     consumer_cfg, pause_typing_before_finalize = self._runner._build_stream_consumer_config(
                         ctx.source, scfg, adapter, on_missing_cursor="raise",
                     )
                     stream_consumer = GatewayStreamConsumer(
-                        adapter=adapter, chat_id=ctx.source.chat_id, config=consumer_cfg,
+                        adapter=adapter, chat_id=_sc_chat_id, config=consumer_cfg,
                         metadata=ctx._status_thread_metadata,
                         on_new_message=(
                             (lambda: ctx.progress_queue.put(("__reset__",))) if ctx.progress_queue is not None else None
@@ -1667,6 +1671,8 @@ class TurnRunner:
         session_key = ctx.session_key or ""
         token = set_current_session_key(session_key)
         register_gateway_notify(session_key, self._approval_notify_sync)
+        _bridge_session_key = self._runner._bridge_session_key_for_source(ctx.source)
+        self._runner._register_bridge_approval(_bridge_session_key, session_key)
         try:
             api_message = _wrap_current_message_with_observed_context(self._native_image_run_message(), observed_group_context)
             kwargs = {"conversation_history": agent_history, "task_id": ctx.session_id}
@@ -1697,6 +1703,7 @@ class TurnRunner:
                 return agent.run_conversation(api_message, **kwargs)
         finally:
             unregister_gateway_notify(session_key)
+            self._runner._unregister_bridge_approval(_bridge_session_key)
             # Cancel pending clarify entries so blocked agent threads don't hang past the end of the
             # run (interrupt, completion, gateway shutdown). Idempotent.
             with suppress(Exception):
